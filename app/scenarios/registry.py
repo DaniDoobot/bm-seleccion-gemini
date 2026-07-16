@@ -4,7 +4,7 @@ All available scenarios are registered here. The voice router resolves a
 scenario by its slug (e.g. "seleccion_1") and retrieves the corresponding
 ScenarioConfig without duplicating Gemini engine logic.
 """
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from app.scenarios.base import ScenarioConfig
 from app.scenarios.seleccion_1 import SELECCION_1_CONFIG
