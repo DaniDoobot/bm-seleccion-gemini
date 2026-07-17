@@ -16,6 +16,7 @@ import asyncio
 from enum import Enum
 import json
 import logging
+import threading
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import websockets
@@ -91,11 +92,12 @@ class GeminiVoiceSession:
         self.twilio_account_sid: Optional[str] = None
         self.recording_sid: Optional[str] = None
         self.recording_started: bool = False
-        self.recording_start_attempted: bool = False
-        self.recording_status: str = "none"
-        self.recording_error: Optional[str] = None
+        self.recording_start_attempted = False
+        self.recording_status = "none"
+        self.recording_error = None
 
-        self.transcript: List[Dict[str, Any]] = []
+        self.transcript = []
+        self._commit_lock = threading.Lock()
 
         self._user_transcript_accumulator = ""
         self._model_transcript_accumulator = ""
@@ -186,6 +188,10 @@ class GeminiVoiceSession:
                 explicit_consent = any(k in text_lower for k in ["acepto", "aceptar", "consentimiento", "consiento"])
                 if explicit_consent:
                     self.onboarding_phase = OnboardingPhase.READY_TO_SAVE
+                    # Trigger deterministic context save immediately
+                    self.commit_candidate_context()
+
+
 
             elif self.onboarding_phase == OnboardingPhase.EXPLANATION:
                 # Strip known positive start phrases that might contain words like "duda" or "repitas"
@@ -394,8 +400,130 @@ class GeminiVoiceSession:
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
         })
 
+    def commit_candidate_context(self) -> dict:
+        """Idempotent helper to persist candidate details, set CONTEXT_SAVED phase, and launch Twilio recording."""
+        with self._commit_lock:
+            if self.candidate_context.get("saved"):
+                logger.info("[Onboarding] Candidate context already saved. Skipping duplicate save.")
+                return {
+                    "status": "already_saved",
+                    "success": True,
+                    "message": "Candidate context was already saved for this session.",
+                    "caller_user_name": self.candidate_context.get("caller_user_name"),
+                    "caller_user_lastname": self.candidate_context.get("caller_user_lastname"),
+                }
+
+            name = getattr(self, "provisional_name", "") or ""
+            lastname = getattr(self, "provisional_lastname", "") or ""
+            name_str = str(name).strip()
+            lastname_str = str(lastname).strip()
+
+            if not name_str or not lastname_str:
+                logger.warning("[Onboarding] commit_candidate_context failed because candidate name/lastname are missing.")
+                return {
+                    "status": "missing_data",
+                    "success": False,
+                    "message": "Faltan el nombre o los apellidos del candidato."
+                }
+
+            self.candidate_context.update({
+                "caller_user_name": name_str,
+                "caller_user_lastname": lastname_str,
+                "rgpd_ok": True,
+                "scenario": getattr(self, "scenario_id", "seleccion_1"),
+                "saved": True
+            })
+            self.onboarding_phase = OnboardingPhase.CONTEXT_SAVED
+            logger.info("RGPD accepted and candidate context saved")
+
+            call_sid = getattr(self, "call_sid", None)
+            if call_sid and not getattr(self, "recording_start_attempted", False):
+                self.recording_start_attempted = True
+                from app.services.twilio_recording import start_twilio_recording
+                try:
+                    logger.info("Triggering Twilio recording. CallSid=%s", call_sid)
+                    scenario_id = getattr(self, "scenario_id", "seleccion_1")
+                    rec_sid = start_twilio_recording(call_sid, scenario_id)
+                    if rec_sid:
+                        self.recording_sid = rec_sid
+                        self.recording_started = True
+                        self.recording_status = "in_progress"
+                        logger.info("Recording started. call_sid=%s recording_sid=%s", call_sid, rec_sid)
+                    else:
+                        self.recording_error = "failed_to_start"
+                        logger.warning("Recording start failed for CallSid=%s", call_sid)
+                except Exception as e:
+                    logger.error("Error starting recording: %s", e)
+
+            # Inform Gemini of the commit and force explanation phase transition
+            instruction = (
+                "[SISTEMA: El contexto del candidato y su aceptación RGPD han sido guardados correctamente en el sistema. "
+                "La grabación de la llamada ha comenzado con éxito. Procede de inmediato a explicar detalladamente al candidato "
+                "las instrucciones de la prueba y la situación del roleplay, hablando en tu papel de paciente de forma natural.]"
+            )
+            
+            async def _send_instruction():
+                try:
+                    await self.send_text_turn(instruction)
+                    logger.info("[Onboarding] Forced explanation instruction to Gemini Live.")
+                except Exception as e:
+                    logger.error("[Onboarding] Error sending explanation instruction to Gemini: %s", e)
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_send_instruction())
+            except RuntimeError:
+                pass  # Ignore if no running loop (e.g. unit tests)
+
+            return {
+                "status": "saved",
+                "success": True,
+                "message": "Candidate context saved successfully."
+            }
+
+    async def reconnect(self) -> None:
+        """Reconnect to Gemini Live and restore the state of the conversation."""
+        logger.info("[Session] Attempting transient reconnect to Gemini Live...")
+        if self._ws:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass
+            self._ws = None
+        self._ready = False
+
+        await self.connect()
+
+        # Build and send internal state summary
+        name = self.candidate_context.get("caller_user_name", "")
+        lastname = self.candidate_context.get("caller_user_lastname", "")
+        phase = self.onboarding_phase
+
+        state_info = f"[SISTEMA: RECONEXIÓN DETECTADA. La sesión con el candidato se ha restablecido. "
+        state_info += f"Candidato: {name} {lastname}. "
+        state_info += f"Fase de onboarding actual: {phase.value}. "
+
+        if phase in [OnboardingPhase.CONTEXT_SAVED, OnboardingPhase.EXPLANATION]:
+            state_info += "El contexto y la aceptación RGPD ya están guardados en el sistema. La grabación está en curso. "
+            state_info += "No vuelvas a pedir el nombre, apellidos ni RGPD. Procede o continúa explicando las instrucciones de la prueba y la situación del roleplay al candidato de forma natural en tu personaje."
+        elif phase == OnboardingPhase.ROLEPLAY_ACTIVE:
+            state_info += "El onboarding se ha completado y el roleplay está ACTIVO. El candidato ya está interactuando en el papel. "
+            state_info += "Continúa la simulación en tu personaje de paciente de forma natural, retomando la conversación desde el punto en el que se cortó."
+        elif phase == OnboardingPhase.ROLEPLAY_FINISHED:
+            state_info += "La simulación ha finalizado. Despídete formalmente en personaje."
+        else:
+            state_info += "Aún no se ha completado el onboarding. Continúa el flujo de onboarding en la pregunta correspondiente a la fase indicada (nombre, confirmación de datos o aceptación RGPD) de manera natural."
+
+        state_info += "]"
+
+        try:
+            await self.send_text_turn(state_info)
+            logger.info("[Session] Sent reconnection state info to Gemini Live.")
+        except Exception as e:
+            logger.error("[Session] Failed to send reconnection state info: %s", e)
 
     async def receive(self) -> AsyncIterator[dict]:
+
         """Yield normalized event dicts from the Gemini WebSocket.
 
         Yielded event shapes:

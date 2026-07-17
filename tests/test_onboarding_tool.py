@@ -34,6 +34,29 @@ class MockSession:
         self.provisional_name = None
         self.provisional_lastname = None
 
+    def commit_candidate_context(self) -> dict:
+        if self.candidate_context.get("saved"):
+            return {
+                "status": "already_saved",
+                "success": True,
+                "message": "Candidate context was already saved for this session.",
+                "caller_user_name": self.candidate_context.get("caller_user_name"),
+                "caller_user_lastname": self.candidate_context.get("caller_user_lastname"),
+            }
+        self.candidate_context.update({
+            "caller_user_name": self.provisional_name,
+            "caller_user_lastname": self.provisional_lastname,
+            "rgpd_ok": True,
+            "scenario": "seleccion_1",
+            "saved": True
+        })
+        self.onboarding_phase = OnboardingPhase.CONTEXT_SAVED
+        return {
+            "status": "saved",
+            "success": True,
+            "message": "Candidate context saved successfully."
+        }
+
 
 # ── 1. Schema Declarations Validation ─────────────────────────────────────────
 
@@ -147,7 +170,7 @@ def test_onboarding_transitions_sequentially():
 
     # 5. User accepts RGPD consent
     session.process_user_transcript("Sí, acepto ambas cosas.")
-    assert session.onboarding_phase == OnboardingPhase.READY_TO_SAVE
+    assert session.onboarding_phase == OnboardingPhase.CONTEXT_SAVED
 
 
 def test_cannot_skip_from_candidate_data_to_ready_to_save():

@@ -252,6 +252,9 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
 
             except WebSocketDisconnect:
                 logger.info("Twilio WebSocket disconnected.")
+            except websockets.exceptions.ConnectionClosed as exc:
+                logger.warning("Gemini ConnectionClosed in twilio_to_gemini: code=%d", exc.code)
+                gemini_session.last_close_code = exc.code
             except Exception as exc:
                 logger.error("Error in twilio_to_gemini_loop: %s", exc)
 
@@ -267,7 +270,8 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                         logger.info(
                             "Gemini ready. scenario=%s", scenario_config.scenario_id
                         )
-                        if scenario_config.initial_message:
+                        # Only send initial message if we are in WAITING_READY (first attempt, not reconnect)
+                        if scenario_config.initial_message and gemini_session.onboarding_phase == OnboardingPhase.WAITING_READY:
                             await gemini_session.send_text_turn(
                                 f'Di únicamente, palabra por palabra, sin preámbulos ni comentarios adicionales: "{scenario_config.initial_message}"'
                             )
@@ -311,29 +315,64 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             "Unhandled Gemini event: %s", event_data.get("raw")
                         )
 
+            except websockets.exceptions.ConnectionClosed as exc:
+                logger.warning("Gemini ConnectionClosed: code=%d, reason=%s", exc.code, exc.reason)
+                gemini_session.last_close_code = exc.code
             except websockets.exceptions.WebSocketException as exc:
                 logger.error("Gemini WebSocket error: %s", exc)
+                gemini_session.last_close_code = getattr(exc, "code", 1006)
             except Exception as exc:
                 logger.error("Error in gemini_to_twilio_loop: %s", exc)
 
-        # ── Run both loops concurrently ───────────────────────────────────────
-        tw_task = asyncio.create_task(twilio_to_gemini_loop())
-        gem_task = asyncio.create_task(gemini_to_twilio_loop())
+        # ── Reconnection loop wrapper ─────────────────────────────────────────
+        max_reconnect_attempts = 1
+        reconnect_attempts = 0
 
-        done, pending = await asyncio.wait(
-            [tw_task, gem_task],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
+        while True:
+            gemini_session.last_close_code = None
 
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            tw_task = asyncio.create_task(twilio_to_gemini_loop())
+            gem_task = asyncio.create_task(gemini_to_twilio_loop())
+
+            done, pending = await asyncio.wait(
+                [tw_task, gem_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            close_code = getattr(gemini_session, "last_close_code", None)
+            if close_code in [1011, 1012, 1006] and reconnect_attempts < max_reconnect_attempts:
+                reconnect_attempts += 1
+                logger.warning(
+                    "Transient disconnect detected (code=%s). Reconnecting (attempt %d/%d) in 1 second...",
+                    close_code,
+                    reconnect_attempts,
+                    max_reconnect_attempts
+                )
+                await asyncio.sleep(1.0)
+                try:
+                    await gemini_session.reconnect()
+                    gemini_ready = False
+                    continue  # Restart loops
+                except Exception as rec_exc:
+                    logger.error("Reconnection attempt failed: %s", rec_exc)
+                    was_failed = True
+                    break
+            else:
+                if close_code is not None:
+                    # Connection closed with non-transient code or exceeded retries
+                    was_failed = True
+                break
 
     except Exception as exc:
         logger.error("Unexpected error in voice_stream: %s", exc)
+        was_failed = True
         was_failed = True
 
     finally:

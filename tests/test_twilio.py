@@ -1,4 +1,5 @@
 import pytest
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -577,5 +578,233 @@ def test_conversation_id_correlation_in_transcript_event(mock_send_event, mock_s
     assert payload["data"]["conversation_id"] == "CA_TRANSCRIPT_123"
     assert payload["data"]["call_sid"] == "CA_TRANSCRIPT_123"
     assert payload["data"]["candidate"]["rgpd_ok"] is True
+
+
+# 9. Transient reconnects & RGPD auto-commit tests
+@pytest.mark.asyncio
+async def test_rgpd_acceptance_auto_commits_context():
+    """Verify that when user transcript contains explicit RGPD acceptance, the context is saved immediately and phase goes to CONTEXT_SAVED."""
+    settings = Settings(env_file=None)
+    session = GeminiVoiceSession(settings=settings, system_instruction="instruction")
+    
+    # Setup provisional info
+    session.provisional_name = "Daniel"
+    session.provisional_lastname = "Martínez"
+    session.call_sid = "CA123"
+    session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
+    
+    # Mock Twilio recording to return a dummy sid
+    with patch("app.services.twilio_recording.start_twilio_recording", return_value="RE999"):
+        # Explicit acceptance
+        session.process_user_transcript("Sí, acepto el consentimiento y la grabación.")
+        
+        # Give event loop a chance to run background tasks
+        await asyncio.sleep(0.1)
+        
+        assert session.candidate_context["saved"] is True
+        assert session.candidate_context["rgpd_ok"] is True
+        assert session.onboarding_phase == OnboardingPhase.CONTEXT_SAVED
+        assert session.recording_started is True
+        assert session.recording_sid == "RE999"
+
+
+@pytest.mark.asyncio
+async def test_subsequent_tool_call_returns_already_saved():
+    """Verify that once auto-saved, calling the tool save_candidate_context returns status: already_saved without double starting the recording."""
+    settings = Settings(env_file=None)
+    session = GeminiVoiceSession(settings=settings, system_instruction="instruction")
+    
+    session.provisional_name = "Daniel"
+    session.provisional_lastname = "Martínez"
+    session.call_sid = "CA123"
+    session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
+    
+    with patch("app.services.twilio_recording.start_twilio_recording", return_value="RE999") as mock_record:
+        session.process_user_transcript("Sí, acepto.")
+        await asyncio.sleep(0.1)
+        
+        assert session.recording_started is True
+        assert mock_record.call_count == 1
+        
+        # Now run the tool handler
+        handler = make_save_candidate_context_handler(session, "seleccion_1")
+        res = handler({
+            "caller_user_name": "Daniel",
+            "caller_user_lastname": "Martínez",
+            "rgpd_ok": "Si",
+            "scenario": "seleccion_1"
+        })
+        
+        assert res["success"] is False
+        assert res["status"] == "already_saved"
+        assert mock_record.call_count == 1  # Verify recording was not double started!
+
+
+@patch("app.routers.voice.GeminiVoiceSession")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_transient_reconnect_1011(mock_send_event, mock_session_class, monkeypatch):
+    """Verify that a 1011 close code triggers a single reconnect attempt, preserves context, and doesn't repeat onboarding."""
+    def mock_get_settings():
+        return Settings(
+            gemini_api_key="dummy-key",
+            env_file=None
+        )
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+
+    mock_session_inst = MagicMock()
+    mock_session_inst.connect = AsyncMock()
+    mock_session_inst.reconnect = AsyncMock()
+    mock_session_inst.close = AsyncMock()
+    mock_session_inst.recording_started = True
+    mock_session_inst.onboarding_phase = OnboardingPhase.ROLEPLAY_ACTIVE
+    mock_session_inst.candidate_context = {
+        "saved": True,
+        "caller_user_name": "Daniel",
+        "caller_user_lastname": "Martínez",
+        "rgpd_ok": True
+    }
+    mock_session_inst.transcript = []
+
+    # First receive raises ConnectionClosed with code 1011
+    async def mock_receive_first():
+        yield {"type": "setup_complete"}
+        # Raise websockets ConnectionClosed
+        from websockets.exceptions import ConnectionClosed
+        from websockets.frames import Close
+        raise ConnectionClosed(Close(1011, "Internal Error"), None)
+
+    mock_session_inst.receive = mock_receive_first
+    mock_session_class.return_value = mock_session_inst
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with client.websocket_connect("/voice/stream?scenario=seleccion_1") as websocket:
+            websocket.send_json({"event": "connected"})
+            websocket.send_json({
+                "event": "start",
+                "start": {
+                    "accountSid": "AC_TEST",
+                    "streamSid": "MZ_TEST",
+                    "callSid": "CA_RECONNECT_123"
+                }
+            })
+            import time
+            time.sleep(0.2) # Allow connection and loops to run
+
+    # Verify reconnect was called
+    mock_session_inst.reconnect.assert_called_once()
+
+
+@patch("app.routers.voice.GeminiVoiceSession")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_reconnect_failure_sends_session_completed_if_rgpd_accepted(mock_send_event, mock_session_class, monkeypatch):
+    """Verify that if reconnect fails after RGPD accepted, session.completed is sent with status=failed and completion_reason=gemini_error."""
+    def mock_get_settings():
+        return Settings(
+            gemini_api_key="dummy-key",
+            env_file=None
+        )
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+
+    mock_session_inst = MagicMock()
+    mock_session_inst.connect = AsyncMock()
+    # Mock reconnect to raise exception
+    mock_session_inst.reconnect.side_effect = Exception("Permanent connection drop")
+    mock_session_inst.close = AsyncMock()
+    mock_session_inst.recording_started = True
+    mock_session_inst.onboarding_phase = OnboardingPhase.CONTEXT_SAVED
+    mock_session_inst.candidate_context = {
+        "saved": True,
+        "caller_user_name": "Daniel",
+        "caller_user_lastname": "Martínez",
+        "rgpd_ok": True
+    }
+    mock_session_inst.transcript = []
+
+    async def mock_receive():
+        yield {"type": "setup_complete"}
+        from websockets.exceptions import ConnectionClosed
+        from websockets.frames import Close
+        raise ConnectionClosed(Close(1011, "Internal Error"), None)
+
+    mock_session_inst.receive = mock_receive
+    mock_session_class.return_value = mock_session_inst
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with client.websocket_connect("/voice/stream?scenario=seleccion_1") as websocket:
+            websocket.send_json({"event": "connected"})
+            websocket.send_json({
+                "event": "start",
+                "start": {
+                    "accountSid": "AC_TEST",
+                    "streamSid": "MZ_TEST",
+                    "callSid": "CA_RECONNECT_FAIL_123"
+                }
+            })
+            import time
+            time.sleep(0.2)
+
+    time.sleep(0.1)
+    
+    mock_send_event.assert_called_once()
+    args, kwargs = mock_send_event.call_args
+    event_type, payload, idempotency_key = args
+    
+    assert payload["type"] == "post_call_transcription"
+    assert payload["data"]["session"]["status"] == "failed"
+    assert payload["data"]["session"]["completion_reason"] == "gemini_error"
+
+
+@patch("app.routers.voice.GeminiVoiceSession")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_reconnect_failure_does_not_send_n8n_if_no_consent(mock_send_event, mock_session_class, monkeypatch):
+    """Verify that if reconnect fails before consent is given, no n8n session.completed is sent."""
+    def mock_get_settings():
+        return Settings(
+            gemini_api_key="dummy-key",
+            env_file=None
+        )
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+
+    mock_session_inst = MagicMock()
+    mock_session_inst.connect = AsyncMock()
+    mock_session_inst.reconnect.side_effect = Exception("Permanent connection drop")
+    mock_session_inst.close = AsyncMock()
+    mock_session_inst.recording_started = False
+    mock_session_inst.onboarding_phase = OnboardingPhase.WAITING_CANDIDATE_DATA
+    mock_session_inst.candidate_context = {
+        "saved": False,
+        "caller_user_name": None,
+        "caller_user_lastname": None,
+        "rgpd_ok": None
+    }
+    mock_session_inst.transcript = []
+
+    async def mock_receive():
+        yield {"type": "setup_complete"}
+        from websockets.exceptions import ConnectionClosed
+        from websockets.frames import Close
+        raise ConnectionClosed(Close(1011, "Internal Error"), None)
+
+    mock_session_inst.receive = mock_receive
+    mock_session_class.return_value = mock_session_inst
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with client.websocket_connect("/voice/stream?scenario=seleccion_1") as websocket:
+            websocket.send_json({"event": "connected"})
+            websocket.send_json({
+                "event": "start",
+                "start": {
+                    "accountSid": "AC_TEST",
+                    "streamSid": "MZ_TEST",
+                    "callSid": "CA_RECONNECT_FAIL_NOCONSENT"
+                }
+            })
+            import time
+            time.sleep(0.2)
+
+    time.sleep(0.1)
+    
+    mock_send_event.assert_not_called()
+
 
 
