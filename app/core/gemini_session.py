@@ -116,9 +116,22 @@ class GeminiVoiceSession:
             return
         self._last_user_transcript = clean_text
 
-        logger.info("[Onboarding] Candidate turn: '%s' (Current Phase: %s)", clean_text, self.onboarding_phase)
+        logger.info(
+            "Candidate turn completed. phase=%s chars=%d",
+            self.onboarding_phase.value if hasattr(self.onboarding_phase, "value") else str(self.onboarding_phase),
+            len(clean_text)
+        )
+        if getattr(self._settings, "log_transcripts", False):
+            logger.debug("[Onboarding] Candidate turn: '%s'", clean_text)
+
+        old_phase = self.onboarding_phase
         self._update_onboarding_state(clean_text, is_user=True)
-        logger.info("[Onboarding] Phase transitioned to: %s", self.onboarding_phase)
+        if old_phase != self.onboarding_phase:
+            logger.info(
+                "Phase transitioned from %s to %s",
+                old_phase.value if hasattr(old_phase, "value") else str(old_phase),
+                self.onboarding_phase.value if hasattr(self.onboarding_phase, "value") else str(self.onboarding_phase)
+            )
 
     def process_model_transcript(self, text: str) -> None:
         """Process a Gemini/model turn to update the onboarding phase."""
@@ -131,9 +144,22 @@ class GeminiVoiceSession:
             return
         self._last_model_transcript = clean_text
 
-        logger.info("[Onboarding] Gemini turn: '%s' (Current Phase: %s)", clean_text, self.onboarding_phase)
+        logger.info(
+            "Patient turn completed. phase=%s chars=%d",
+            self.onboarding_phase.value if hasattr(self.onboarding_phase, "value") else str(self.onboarding_phase),
+            len(clean_text)
+        )
+        if getattr(self._settings, "log_transcripts", False):
+            logger.debug("[Onboarding] Gemini turn: '%s'", clean_text)
+
+        old_phase = self.onboarding_phase
         self._update_onboarding_state(clean_text, is_user=False)
-        logger.info("[Onboarding] Phase transitioned to: %s", self.onboarding_phase)
+        if old_phase != self.onboarding_phase:
+            logger.info(
+                "Phase transitioned from %s to %s",
+                old_phase.value if hasattr(old_phase, "value") else str(old_phase),
+                self.onboarding_phase.value if hasattr(self.onboarding_phase, "value") else str(self.onboarding_phase)
+            )
 
     def _update_onboarding_state(self, text: str, is_user: bool) -> None:
         text_lower = text.lower()
@@ -191,26 +217,37 @@ class GeminiVoiceSession:
                     # Trigger deterministic context save immediately
                     self.commit_candidate_context()
 
-
-
             elif self.onboarding_phase == OnboardingPhase.EXPLANATION:
                 # Strip known positive start phrases that might contain words like "duda" or "repitas"
                 check_text = text_lower
-                for p in ["no tengo dudas", "no tengo duda", "no necesito que repitas", "no necesito que se repita", "sin dudas", "sin duda"]:
+                for p in ["no tengo dudas", "no tengo duda", "no necesito que repitas", "sin dudas", "sin duda", "ninguna duda"]:
                     check_text = check_text.replace(p, "")
-                
-                # Check for doubts, corrections, repetitions or negative intent first
-                has_doubt_or_negation = any(k in check_text for k in [
-                    "duda", "pregunta", "repetir", "repitas", "no podemos", "todavia no", "aun no", "no entendi", "tengo una"
-                ])
-                if not has_doubt_or_negation:
-                    # Check for positive start intent
+                has_doubt = any(k in check_text for k in ["duda", "pregunta", "repetir", "repitas", "no podemos", "todavia no", "no entendi", "tengo una"])
+                if not has_doubt:
+                    # Positive start intent directly transitions to READY_TO_START_ROLEPLAY for compatibility
                     start_intent = any(k in text_lower for k in [
-                        "podemos comenzar", "podemos empezar", "no tengo dudas", "no necesito que repitas", 
-                        "comenzamos", "empezamos", "comenzar", "empezar", "listo", "preparado", "sí podemos"
+                        "si", "sí", "correcto", "comenzar", "empezar", "listo", "preparado", "entendido", "ninguna duda", "no tengo dudas", "adelante", "comenzamos"
                     ])
                     if start_intent:
                         self.onboarding_phase = OnboardingPhase.READY_TO_START_ROLEPLAY
+
+            elif self.onboarding_phase == OnboardingPhase.READY_TO_START_ROLEPLAY:
+                # Candidate confirms they are prepared / understood instructions
+                check_text = text_lower
+                for p in ["no tengo dudas", "no tengo duda", "no necesito que repitas", "sin dudas", "sin duda", "ninguna duda"]:
+                    check_text = check_text.replace(p, "")
+                has_doubt_or_negation = any(k in check_text for k in [
+                    "duda", "pregunta", "repetir", "repitas", "no podemos", "todavia no", "no entendi"
+                ])
+                if has_doubt_or_negation:
+                    # Return to EXPLANATION phase
+                    self.onboarding_phase = OnboardingPhase.EXPLANATION
+                else:
+                    start_intent = any(k in text_lower for k in [
+                        "si", "sí", "correcto", "comenzar", "empezar", "listo", "preparado", "entendido", "ninguna duda", "no tengo dudas", "adelante", "comenzamos"
+                    ])
+                    if start_intent:
+                        self.onboarding_phase = OnboardingPhase.ROLEPLAY_ACTIVE
 
         else:
             # Model turns
@@ -223,9 +260,14 @@ class GeminiVoiceSession:
                     self.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
 
             elif self.onboarding_phase == OnboardingPhase.CONTEXT_SAVED:
-                # Model explains the roleplay situation
-                if "explicare" in text_lower or "situacion" in text_lower or "procedimiento" in text_lower:
-                    self.onboarding_phase = OnboardingPhase.EXPLANATION
+                # Any model turn transitions to EXPLANATION
+                self.onboarding_phase = OnboardingPhase.EXPLANATION
+
+            elif self.onboarding_phase == OnboardingPhase.EXPLANATION:
+                # Transition to READY_TO_START_ROLEPLAY when Gemini asks the confirmation question.
+                elements = ["claro", "duda", "pregunta", "entendido", "comenzar", "empezar", "listo", "preparado"]
+                if any(e in text_lower for e in elements):
+                    self.onboarding_phase = OnboardingPhase.READY_TO_START_ROLEPLAY
 
     def _normalize_text(self, text: str) -> str:
         """Helper to normalize text for string matching, stripping punctuation and accents."""
@@ -627,8 +669,9 @@ class GeminiVoiceSession:
                             logger.info("[Onboarding] Roleplay started successfully. Phase: ROLEPLAY_ACTIVE")
                     elif self.onboarding_phase == OnboardingPhase.ROLEPLAY_ACTIVE:
                         norm_accumulated = self._normalize_text(self._model_transcript_accumulator)
-                        norm_closure = self._normalize_text(self._completion_phrase)
-                        if norm_closure in norm_accumulated:
+                        has_terminado = "la prueba ha terminado" in norm_accumulated or "la prueba ha finalizado" in norm_accumulated
+                        has_gracias = "gracias por participar" in norm_accumulated or "gracias por su participacion" in norm_accumulated
+                        if (has_terminado and has_gracias) or ("la prueba ha terminado gracias por participar" in norm_accumulated):
                             self.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
                             logger.info("[Onboarding] Roleplay finished successfully. Phase: ROLEPLAY_FINISHED")
                     

@@ -39,6 +39,7 @@ class Settings(BaseSettings):
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
+    log_transcripts: bool = False
 
     # ── Twilio ────────────────────────────────────────────────────────────────
     twilio_account_sid: str = ""

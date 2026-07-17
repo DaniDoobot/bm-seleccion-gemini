@@ -172,6 +172,18 @@ def test_onboarding_transitions_sequentially():
     session.process_user_transcript("Sí, acepto ambas cosas.")
     assert session.onboarding_phase == OnboardingPhase.CONTEXT_SAVED
 
+    # 6. Model turn in CONTEXT_SAVED transitions to EXPLANATION
+    session.process_model_transcript("Excelente. Te explicaré la situación del roleplay...")
+    assert session.onboarding_phase == OnboardingPhase.EXPLANATION
+
+    # 7. Model turn containing clear/ready words in EXPLANATION transitions to READY_TO_START_ROLEPLAY
+    session.process_model_transcript("¿Está todo claro para comenzar?")
+    assert session.onboarding_phase == OnboardingPhase.READY_TO_START_ROLEPLAY
+
+    # 8. User confirming they are ready in READY_TO_START_ROLEPLAY transitions to ROLEPLAY_ACTIVE
+    session.process_user_transcript("Sí, estoy listo, comencemos.")
+    assert session.onboarding_phase == OnboardingPhase.ROLEPLAY_ACTIVE
+
 
 def test_cannot_skip_from_candidate_data_to_ready_to_save():
     """Ensure session cannot jump straight from WAITING_CANDIDATE_DATA to READY_TO_SAVE."""

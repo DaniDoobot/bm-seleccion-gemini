@@ -302,12 +302,13 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             await websocket.send_text(json.dumps(clear_msg))
 
                     elif event_type == "turn_complete":
-                        # Check if roleplay is finished. If so, exit loop to close connection cleanly.
+                        # Check if roleplay is finished. If so, wait 1.5s for audio buffer to clear, then exit.
                         if gemini_session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED:
                             logger.info(
-                                "Roleplay reached finished phase. Closing stream. scenario=%s",
+                                "Roleplay reached finished phase. Waiting 1.5s for audio buffer to clear, then closing stream. scenario=%s",
                                 scenario_config.scenario_id,
                             )
+                            await asyncio.sleep(1.5)
                             break
 
                     elif event_type == "unknown":

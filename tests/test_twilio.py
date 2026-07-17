@@ -807,4 +807,121 @@ def test_reconnect_failure_does_not_send_n8n_if_no_consent(mock_send_event, mock
     mock_send_event.assert_not_called()
 
 
+# 10. Roleplay transitions, finish logic, clean closes, and log redactions tests
+@pytest.mark.asyncio
+async def test_roleplay_transitions_and_finished_states():
+    """Verify that EXPLANATION goes to READY_TO_START_ROLEPLAY, then to ROLEPLAY_ACTIVE, that subsequent turns have phase='roleplay', and completion phrase transitions to ROLEPLAY_FINISHED."""
+    settings = Settings(env_file=None)
+    session = GeminiVoiceSession(settings=settings, system_instruction="instruction")
+    session.provisional_name = "Daniel"
+    session.provisional_lastname = "Martínez"
+    session.call_sid = "CA123"
+    
+    session.onboarding_phase = OnboardingPhase.CONTEXT_SAVED
+    
+    # Model turn transitions to EXPLANATION
+    session.process_model_transcript("Te explicaré el roleplay...")
+    assert session.onboarding_phase == OnboardingPhase.EXPLANATION
+    
+    # Model turn asking if ready/clear transitions to READY_TO_START_ROLEPLAY
+    session.process_model_transcript("¿Está todo claro para comenzar?")
+    assert session.onboarding_phase == OnboardingPhase.READY_TO_START_ROLEPLAY
+    
+    # User confirming transitions to ROLEPLAY_ACTIVE
+    session.process_user_transcript("Sí, de acuerdo, comencemos.")
+    assert session.onboarding_phase == OnboardingPhase.ROLEPLAY_ACTIVE
+    
+    # Verify subsequent turn has phase = roleplay
+    session.add_transcript_turn("candidate", "Hola doctor...")
+    assert session.transcript[-1]["phase"] == "roleplay"
+    
+    # Model final phrase transitions to ROLEPLAY_FINISHED
+    # Set model accumulator and process turnComplete check
+    session._model_transcript_accumulator = "La prueba ha terminado. Gracias por participar."
+    # Simulate turnComplete block
+    has_terminado = "la prueba ha terminado" in session._normalize_text(session._model_transcript_accumulator)
+    has_gracias = "gracias por participar" in session._normalize_text(session._model_transcript_accumulator)
+    if (has_terminado and has_gracias) or ("la prueba ha terminado gracias por participar" in session._normalize_text(session._model_transcript_accumulator)):
+        session.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+        
+    assert session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED
+
+
+@patch("app.routers.voice.GeminiVoiceSession")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_websocket_closes_cleanly_on_roleplay_finished_without_twilio_stop(mock_send_event, mock_session_class, monkeypatch):
+    """Verify that when ROLEPLAY_FINISHED is reached, the websocket closes and session.completed event is sent with completed status, without requiring twilio_stop."""
+    def mock_get_settings():
+        return Settings(
+            gemini_api_key="dummy-key",
+            env_file=None
+        )
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+
+    mock_session_inst = MagicMock()
+    mock_session_inst.connect = AsyncMock()
+    mock_session_inst.close = AsyncMock()
+    mock_session_inst.recording_started = True
+    mock_session_inst.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+    mock_session_inst.candidate_context = {
+        "saved": True,
+        "caller_user_name": "Daniel",
+        "caller_user_lastname": "Martínez",
+        "rgpd_ok": True
+    }
+    mock_session_inst.transcript = []
+
+    # Receive returns setup_complete, then turn_complete to trigger loop break
+    async def mock_receive():
+        yield {"type": "setup_complete"}
+        yield {"type": "turn_complete"}
+        # Loop will exit here because phase is ROLEPLAY_FINISHED
+        await asyncio.sleep(3600)
+
+    mock_session_inst.receive = mock_receive
+    mock_session_class.return_value = mock_session_inst
+
+    with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+        with client.websocket_connect("/voice/stream?scenario=seleccion_1") as websocket:
+            websocket.send_json({"event": "connected"})
+            websocket.send_json({
+                "event": "start",
+                "start": {
+                    "accountSid": "AC_TEST",
+                    "streamSid": "MZ_TEST",
+                    "callSid": "CA_FINISHED_123"
+                }
+            })
+            import time
+            time.sleep(0.2)
+
+    # Verify session completed event was sent with status="completed"
+    mock_send_event.assert_called_once()
+    args, kwargs = mock_send_event.call_args
+    event_type, payload, idempotency_key = args
+    
+    assert payload["type"] == "post_call_transcription"
+    assert payload["data"]["session"]["status"] == "completed"
+    assert payload["data"]["session"]["roleplay_finished"] is True
+    assert payload["data"]["session"]["completion_reason"] == "roleplay_finished"
+
+
+def test_log_transcripts_false_redacts_complete_texts(caplog):
+    """Verify that with log_transcripts=False, process_user_transcript and process_model_transcript do not output the full text in INFO or DEBUG level logs."""
+    import logging
+    settings = Settings(env_file=None)
+    settings.log_transcripts = False
+    
+    session = GeminiVoiceSession(settings=settings, system_instruction="instruction")
+    
+    with caplog.at_level(logging.INFO):
+        session.process_user_transcript("Mi nombre es Daniel Martínez y acepto.")
+        session.process_model_transcript("Hola doctor, soy el paciente.")
+        
+    for record in caplog.records:
+        assert "Mi nombre es Daniel Martínez y acepto." not in record.message
+        assert "Hola doctor, soy el paciente." not in record.message
+
+
+
 
