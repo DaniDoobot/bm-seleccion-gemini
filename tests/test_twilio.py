@@ -295,6 +295,11 @@ def test_recording_status_callback_204_on_valid_signature(mock_send_event, mock_
     mock_validate.return_value = True
     mock_send_event.return_value = True
     
+    from app.services.call_consent_registry import registry
+    registry.remove("CA111")
+    entry = registry.get_or_create("CA111", "seleccion_1")
+    entry.consent_status = "accepted"
+    
     def mock_get_settings():
         return Settings(
             gemini_api_key="dummy-key",
@@ -349,6 +354,11 @@ def test_recording_status_callback_absent(mock_send_event, mock_validate, monkey
     mock_validate.return_value = True
     mock_send_event.return_value = True
     
+    from app.services.call_consent_registry import registry
+    registry.remove("CA111")
+    entry = registry.get_or_create("CA111", "seleccion_2")
+    entry.consent_status = "accepted"
+    
     def mock_get_settings():
         return Settings(
             gemini_api_key="dummy-key",
@@ -389,7 +399,7 @@ def test_recording_status_callback_absent(mock_send_event, mock_validate, monkey
 # 7. WebSocket start capture, context validation & RGPD requirements
 @patch("app.routers.voice.GeminiVoiceSession")
 def test_websocket_stream_captures_ids_but_does_not_start_recording(mock_session_class, monkeypatch):
-    """Verify WebSocket captures CallSid on start but does not trigger recording immediately."""
+    """Verify WebSocket captures CallSid on start and sets requested status."""
     def mock_get_settings():
         return Settings(
             gemini_api_key="dummy-key",
@@ -437,9 +447,10 @@ def test_websocket_stream_captures_ids_but_does_not_start_recording(mock_session
     assert mock_session_inst.twilio_account_sid == "AC_TEST"
     assert mock_session_inst.scenario_id == "seleccion_1"
     
-    # Recording was NOT triggered because context was not saved
-    assert mock_session_inst.recording_started is False
-    assert mock_session_inst.recording_start_attempted is False
+    # Recording was set as requested from the start
+    assert mock_session_inst.recording_started is True
+    assert mock_session_inst.recording_start_attempted is True
+    assert mock_session_inst.recording_status == "requested"
 
 
 # 8. conversation_id correlation and RGPD normalization tests
@@ -489,6 +500,11 @@ def test_conversation_id_correlation_in_audio_event(mock_send_event, mock_valida
     """Verify that the Audio event contains conversation_id equal to call_sid."""
     mock_validate.return_value = True
     mock_send_event.return_value = True
+    
+    from app.services.call_consent_registry import registry
+    registry.remove("CA_CORRELATION_123")
+    entry = registry.get_or_create("CA_CORRELATION_123", "seleccion_1")
+    entry.consent_status = "accepted"
     
     def mock_get_settings():
         return Settings(
@@ -593,8 +609,8 @@ async def test_rgpd_acceptance_auto_commits_context():
     session.call_sid = "CA123"
     session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
     
-    # Mock Twilio recording to return a dummy sid
-    with patch("app.services.twilio_recording.start_twilio_recording", return_value="RE999"):
+    # Mock Twilio recording to verify it is NEVER called
+    with patch("app.services.twilio_recording.start_twilio_recording") as mock_start_rec:
         # Explicit acceptance
         session.process_user_transcript("Sí, acepto el consentimiento y la grabación.")
         
@@ -604,8 +620,7 @@ async def test_rgpd_acceptance_auto_commits_context():
         assert session.candidate_context["saved"] is True
         assert session.candidate_context["rgpd_ok"] is True
         assert session.onboarding_phase == OnboardingPhase.CONTEXT_SAVED
-        assert session.recording_started is True
-        assert session.recording_sid == "RE999"
+        mock_start_rec.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -619,12 +634,17 @@ async def test_subsequent_tool_call_returns_already_saved():
     session.call_sid = "CA123"
     session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
     
-    with patch("app.services.twilio_recording.start_twilio_recording", return_value="RE999") as mock_record:
+    # Pre-set recording properties as if set by WebSocket start
+    session.recording_started = True
+    session.recording_start_attempted = True
+    session.recording_status = "requested"
+    
+    with patch("app.services.twilio_recording.start_twilio_recording") as mock_record:
         session.process_user_transcript("Sí, acepto.")
         await asyncio.sleep(0.1)
         
         assert session.recording_started is True
-        assert mock_record.call_count == 1
+        mock_record.assert_not_called()
         
         # Now run the tool handler
         handler = make_save_candidate_context_handler(session, "seleccion_1")
@@ -637,7 +657,7 @@ async def test_subsequent_tool_call_returns_already_saved():
         
         assert res["success"] is False
         assert res["status"] == "already_saved"
-        assert mock_record.call_count == 1  # Verify recording was not double started!
+        mock_record.assert_not_called()
 
 
 @patch("app.routers.voice.GeminiVoiceSession")
@@ -921,6 +941,297 @@ def test_log_transcripts_false_redacts_complete_texts(caplog):
     for record in caplog.records:
         assert "Mi nombre es Daniel Martínez y acepto." not in record.message
         assert "Hola doctor, soy el paciente." not in record.message
+
+
+# 11. Mandatory tests for TwiML-driven recording, CallConsentRegistry, and webhook event routing
+def test_twiml_recording_configuration_and_order():
+    """Verify TwiML XML has Start/Recording before Connect/Stream and has dual channels, track=both, trim=do-not-trim, and contains scenario_id."""
+    from app.routers.voice import voice_incoming
+    from fastapi import HTTPException
+    
+    # Mock settings
+    settings = Settings(
+        public_ws_base_url="wss://test.doobot.ai/voice/stream",
+        public_http_base_url="https://test.doobot.ai",
+        env_file=None
+    )
+    with patch("app.routers.voice.get_settings", return_value=settings):
+        # Retrieve TwiML for seleccion_1
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        response = loop.run_until_complete(voice_incoming("seleccion_1"))
+        
+        xml_content = response.body.decode("utf-8")
+        
+        # 1. Assert Start/Recording before Connect/Stream
+        start_idx = xml_content.find("<Start>")
+        connect_idx = xml_content.find("<Connect>")
+        assert start_idx != -1
+        assert connect_idx != -1
+        assert start_idx < connect_idx
+        
+        # 2. Verify configuration attributes
+        assert 'channels="dual"' in xml_content
+        assert 'track="both"' in xml_content
+        assert 'trim="do-not-trim"' in xml_content
+        
+        # 3. Verify scenario_id and callback URL
+        assert 'recordingStatusCallback="https://test.doobot.ai/voice/recording-status/seleccion_1"' in xml_content
+        
+        # Repeat for seleccion_2
+        response_2 = loop.run_until_complete(voice_incoming("seleccion_2"))
+        xml_content_2 = response_2.body.decode("utf-8")
+        assert 'recordingStatusCallback="https://test.doobot.ai/voice/recording-status/seleccion_2"' in xml_content_2
+
+
+def test_first_locution_contains_recording_warning():
+    """Verify that initial_message of both scenarios starts with the recording warning."""
+    from app.scenarios.registry import get_scenario
+    
+    sc_1 = get_scenario("seleccion_1")
+    sc_2 = get_scenario("seleccion_2")
+    
+    warning = "Esta llamada está siendo grabada con fines de formación y evaluación."
+    assert sc_1.initial_message.startswith(warning)
+    assert sc_2.initial_message.startswith(warning)
+
+
+@patch("app.routers.voice.GeminiVoiceSession")
+def test_websocket_start_sets_requested_status(mock_session_class, monkeypatch):
+    """Verify that when WebSocket start is received, recording is set to requested, and registry gets pending status."""
+    def mock_get_settings():
+        return Settings(gemini_api_key="dummy", env_file=None)
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+    
+    mock_session_inst = MagicMock()
+    mock_session_inst.connect = AsyncMock()
+    mock_session_inst.close = AsyncMock()
+    mock_session_class.return_value = mock_session_inst
+    
+    async def mock_receive():
+        yield {"type": "setup_complete"}
+        await asyncio.sleep(3600)
+    mock_session_inst.receive = mock_receive
+    
+    from app.services.call_consent_registry import registry
+    registry.remove("CA_START_TEST")
+    
+    with client.websocket_connect("/voice/stream?scenario=seleccion_1") as websocket:
+        websocket.send_json({"event": "connected"})
+        websocket.send_json({
+            "event": "start",
+            "start": {
+                "accountSid": "AC_TEST",
+                "streamSid": "MZ_TEST",
+                "callSid": "CA_START_TEST"
+            }
+        })
+        import time
+        time.sleep(0.2)
+        
+    assert mock_session_inst.recording_started is True
+    assert mock_session_inst.recording_start_attempted is True
+    assert mock_session_inst.recording_status == "requested"
+    
+    entry = registry.get("CA_START_TEST")
+    assert entry is not None
+    assert entry.consent_status == "pending"
+
+
+@patch("twilio.request_validator.RequestValidator.validate")
+def test_in_progress_callback_updates_registry_without_n8n(mock_validate, monkeypatch):
+    """Verify that in-progress callback updates registry and returns 204 without sending event to n8n."""
+    mock_validate.return_value = True
+    
+    def mock_get_settings():
+        return Settings(twilio_auth_token="dummy", public_http_base_url="https://test.doobot.ai", env_file=None)
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+    
+    from app.services.call_consent_registry import registry
+    registry.remove("CA_IP_TEST")
+    entry = registry.get_or_create("CA_IP_TEST", "seleccion_1")
+    
+    with patch("app.services.n8n_events.send_n8n_event") as mock_n8n:
+        response = client.post(
+            "/voice/recording-status/seleccion_1",
+            data={
+                "CallSid": "CA_IP_TEST",
+                "RecordingSid": "RE_IP_123",
+                "RecordingStatus": "in-progress"
+            },
+            headers={"X-Twilio-Signature": "dummy"}
+        )
+        assert response.status_code == 204
+        mock_n8n.assert_not_called()
+        
+    assert entry.recording_sid == "RE_IP_123"
+    assert entry.recording_status == "in-progress"
+
+
+@patch("twilio.request_validator.RequestValidator.validate")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_completed_callback_accepted_consent(mock_n8n, mock_validate, monkeypatch):
+    """Verify that completed callback with accepted consent sends post_call_audio immediately."""
+    mock_validate.return_value = True
+    def mock_get_settings():
+        return Settings(twilio_auth_token="dummy", public_http_base_url="https://test.doobot.ai", env_file=None)
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+    
+    from app.services.call_consent_registry import registry
+    registry.remove("CA_ACCEPTED_TEST")
+    entry = registry.get_or_create("CA_ACCEPTED_TEST", "seleccion_1")
+    entry.consent_status = "accepted"
+    
+    response = client.post(
+        "/voice/recording-status/seleccion_1",
+        data={
+            "CallSid": "CA_ACCEPTED_TEST",
+            "RecordingSid": "RE_ACC_123",
+            "RecordingStatus": "completed",
+            "RecordingUrl": "https://api.twilio.com/rec"
+        },
+        headers={"X-Twilio-Signature": "dummy"}
+    )
+    assert response.status_code == 204
+    
+    import time
+    time.sleep(0.1)
+    mock_n8n.assert_called_once()
+    args, _ = mock_n8n.call_args
+    assert args[0] == "recording.completed"
+    assert args[1]["type"] == "post_call_audio"
+    assert args[1]["data"]["recording"]["url"] == "https://api.twilio.com/rec"
+
+
+@patch("twilio.request_validator.RequestValidator.validate")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_completed_callback_rejected_consent(mock_n8n, mock_validate, monkeypatch):
+    """Verify that completed callback with rejected consent does not send event to n8n."""
+    mock_validate.return_value = True
+    def mock_get_settings():
+        return Settings(twilio_auth_token="dummy", public_http_base_url="https://test.doobot.ai", env_file=None)
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+    
+    from app.services.call_consent_registry import registry
+    registry.remove("CA_REJECTED_TEST")
+    entry = registry.get_or_create("CA_REJECTED_TEST", "seleccion_1")
+    entry.consent_status = "rejected"
+    
+    response = client.post(
+        "/voice/recording-status/seleccion_1",
+        data={
+            "CallSid": "CA_REJECTED_TEST",
+            "RecordingSid": "RE_REJ_123",
+            "RecordingStatus": "completed",
+            "RecordingUrl": "https://api.twilio.com/rec"
+        },
+        headers={"X-Twilio-Signature": "dummy"}
+    )
+    assert response.status_code == 204
+    import time
+    time.sleep(0.1)
+    mock_n8n.assert_not_called()
+
+
+@patch("twilio.request_validator.RequestValidator.validate")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_completed_callback_pending_then_accepted_or_rejected(mock_n8n, mock_validate, monkeypatch):
+    """Verify that completed callback with pending consent is stored, then sent on accepted or dropped on rejected."""
+    mock_validate.return_value = True
+    def mock_get_settings():
+        return Settings(twilio_auth_token="dummy", public_http_base_url="https://test.doobot.ai", env_file=None)
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+    
+    from app.services.call_consent_registry import registry
+    registry.remove("CA_PENDING_TEST")
+    entry = registry.get_or_create("CA_PENDING_TEST", "seleccion_1")
+    entry.consent_status = "pending"
+    
+    response = client.post(
+        "/voice/recording-status/seleccion_1",
+        data={
+            "CallSid": "CA_PENDING_TEST",
+            "RecordingSid": "RE_PEND_123",
+            "RecordingStatus": "completed",
+            "RecordingUrl": "https://api.twilio.com/rec"
+        },
+        headers={"X-Twilio-Signature": "dummy"}
+    )
+    assert response.status_code == 204
+    import time
+    time.sleep(0.1)
+    mock_n8n.assert_not_called()
+    assert entry.pending_recording_event is not None
+    
+    # Simulate later acceptance
+    session = GeminiVoiceSession(settings=mock_get_settings(), system_instruction="")
+    session.provisional_name = "Daniel"
+    session.provisional_lastname = "Martínez"
+    session.call_sid = "CA_PENDING_TEST"
+    session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
+    
+    session.commit_candidate_context()
+    time.sleep(0.1)
+    mock_n8n.assert_called_once()
+    assert entry.pending_recording_event is None # check cleared
+    
+    # Test pending then rejected
+    registry.remove("CA_PENDING_TEST2")
+    entry2 = registry.get_or_create("CA_PENDING_TEST2", "seleccion_1")
+    entry2.consent_status = "pending"
+    
+    client.post(
+        "/voice/recording-status/seleccion_1",
+        data={
+            "CallSid": "CA_PENDING_TEST2",
+            "RecordingSid": "RE_PEND_456",
+            "RecordingStatus": "completed",
+            "RecordingUrl": "https://api.twilio.com/rec"
+        },
+        headers={"X-Twilio-Signature": "dummy"}
+    )
+    assert entry2.pending_recording_event is not None
+    
+    # Simulate rejection
+    session2 = GeminiVoiceSession(settings=mock_get_settings(), system_instruction="")
+    session2.provisional_name = "Daniel"
+    session2.provisional_lastname = "Martínez"
+    session2.call_sid = "CA_PENDING_TEST2"
+    session2.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
+    
+    session2.process_user_transcript("No acepto.")
+    assert entry2.pending_recording_event is None
+    assert entry2.consent_status == "rejected"
+
+
+@patch("twilio.request_validator.RequestValidator.validate")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_completed_callback_unknown_call_sid(mock_n8n, mock_validate, monkeypatch):
+    """Verify that completed callback for unknown call_sid does not send event to n8n."""
+    mock_validate.return_value = True
+    def mock_get_settings():
+        return Settings(twilio_auth_token="dummy", public_http_base_url="https://test.doobot.ai", env_file=None)
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+    
+    from app.services.call_consent_registry import registry
+    registry.remove("CA_UNKNOWN_TEST")
+    
+    response = client.post(
+        "/voice/recording-status/seleccion_1",
+        data={
+            "CallSid": "CA_UNKNOWN_TEST",
+            "RecordingSid": "RE_UNK_123",
+            "RecordingStatus": "completed",
+            "RecordingUrl": "https://api.twilio.com/rec"
+        },
+        headers={"X-Twilio-Signature": "dummy"}
+    )
+    assert response.status_code == 204
+    import time
+    time.sleep(0.1)
+    mock_n8n.assert_not_called()
+
 
 
 

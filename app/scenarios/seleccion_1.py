@@ -112,6 +112,7 @@ SELECCION_1_CONFIG = ScenarioConfig(
     ),
     system_instruction=_FULL_SYSTEM_INSTRUCTION,
     initial_message=(
+        "Esta llamada está siendo grabada con fines de formación y evaluación. "
         "Hola soy Miguel, asistente virtual para evaluación de candidatos "
         "de Boston Medical, esta es la primera prueba, ¿Estás preparado para comenzar?"
     ),

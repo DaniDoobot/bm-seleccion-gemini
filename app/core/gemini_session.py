@@ -210,12 +210,48 @@ class GeminiVoiceSession:
 
             elif self.onboarding_phase == OnboardingPhase.WAITING_RGPD_ACCEPTANCE:
                 # Explicit consent only: "acepto", "aceptar", "consentimiento", "consiento".
-                # Simple "si", "correcto", "vale", "de acuerdo" are blocked.
-                explicit_consent = any(k in text_lower for k in ["acepto", "aceptar", "consentimiento", "consiento"])
-                if explicit_consent:
-                    self.onboarding_phase = OnboardingPhase.READY_TO_SAVE
-                    # Trigger deterministic context save immediately
-                    self.commit_candidate_context()
+                # Check for explicit rejection first
+                is_rejection = any(k in text_lower for k in ["no acepto", "no consiento", "rechazo", "niego"]) or (text_lower.strip() in ["no", "no.", "no, gracias"])
+                if is_rejection:
+                    logger.info("RGPD consent was explicitly rejected by the candidate.")
+                    self.candidate_context.update({
+                        "rgpd_ok": False,
+                        "saved": False
+                    })
+                    self.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+                    self.completion_reason = "rgpd_rejected"
+                    
+                    # Update consent registry to rejected
+                    from app.services.call_consent_registry import registry
+                    call_sid = getattr(self, "call_sid", None)
+                    if call_sid:
+                        registry.update_consent(call_sid, "rejected")
+                        # Clear any pending recording events
+                        entry = registry.get(call_sid)
+                        if entry:
+                            entry.pending_recording_event = None
+                    
+                    # Inform Gemini of the rejection to bid farewell
+                    instruction = (
+                        "[SISTEMA: El candidato ha rechazado explícitamente el consentimiento RGPD. "
+                        "No podemos proceder con la prueba ni registrar sus datos. Pronuncia exactamente "
+                        "esta frase de despedida: \"De acuerdo. Finalizamos la llamada. Gracias.\" y termina "
+                        "la llamada inmediatamente.]"
+                    )
+                    try:
+                        import asyncio
+                        async def _send_rejection():
+                            await self.send_text_turn(instruction)
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(_send_rejection())
+                    except Exception:
+                        pass
+                else:
+                    explicit_consent = any(k in text_lower for k in ["acepto", "aceptar", "consentimiento", "consiento"])
+                    if explicit_consent:
+                        self.onboarding_phase = OnboardingPhase.READY_TO_SAVE
+                        # Trigger deterministic context save immediately
+                        self.commit_candidate_context()
 
             elif self.onboarding_phase == OnboardingPhase.EXPLANATION:
                 # Strip known positive start phrases that might contain words like "duda" or "repitas"
@@ -478,24 +514,29 @@ class GeminiVoiceSession:
             self.onboarding_phase = OnboardingPhase.CONTEXT_SAVED
             logger.info("RGPD accepted and candidate context saved")
 
+            # Update consent registry to accepted and dispatch any pending recording event
+            from app.services.call_consent_registry import registry
             call_sid = getattr(self, "call_sid", None)
-            if call_sid and not getattr(self, "recording_start_attempted", False):
-                self.recording_start_attempted = True
-                from app.services.twilio_recording import start_twilio_recording
-                try:
-                    logger.info("Triggering Twilio recording. CallSid=%s", call_sid)
-                    scenario_id = getattr(self, "scenario_id", "seleccion_1")
-                    rec_sid = start_twilio_recording(call_sid, scenario_id)
-                    if rec_sid:
-                        self.recording_sid = rec_sid
-                        self.recording_started = True
-                        self.recording_status = "in_progress"
-                        logger.info("Recording started. call_sid=%s recording_sid=%s", call_sid, rec_sid)
-                    else:
-                        self.recording_error = "failed_to_start"
-                        logger.warning("Recording start failed for CallSid=%s", call_sid)
-                except Exception as e:
-                    logger.error("Error starting recording: %s", e)
+            if call_sid:
+                entry = registry.update_consent(call_sid, "accepted")
+                if entry and entry.pending_recording_event:
+                    event = entry.pending_recording_event
+                    entry.pending_recording_event = None  # clear to ensure it is sent once
+                    
+                    async def _send_pending_event():
+                        try:
+                            from app.services.n8n_events import send_n8n_event
+                            logger.info("[Consent] Sending pending recording event for CallSid=%s", call_sid)
+                            await send_n8n_event("recording.completed", event, f"recording.completed:{entry.recording_sid}")
+                        except Exception as err:
+                            logger.error("[Consent] Error dispatching pending recording event: %s", err)
+                    
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(_send_pending_event())
+                    except RuntimeError:
+                        asyncio.run(_send_pending_event())
+            logger.info("RGPD accepted: call recording is already active from the start.")
 
             # Inform Gemini of the commit and force explanation phase transition
             instruction = (

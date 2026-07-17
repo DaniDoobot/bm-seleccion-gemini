@@ -115,6 +115,17 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
     gemini_session.twilio_account_sid = account_sid
     gemini_session.scenario_id = scenario_config.scenario_id
     gemini_session._started_at_dt = datetime.datetime.now(datetime.timezone.utc)
+    
+    # Initialize/update consent registry for the call
+    from app.services.call_consent_registry import registry
+    entry = registry.get_or_create(call_sid, scenario_config.scenario_id)
+    if entry.consent_status not in ["accepted", "rejected"]:
+        entry.consent_status = "pending"
+
+    # Mark recording as requested from TwiML to avoid REST API duplication
+    gemini_session.recording_started = True
+    gemini_session.recording_start_attempted = True
+    gemini_session.recording_status = "requested"
 
     # Register scenario tool handlers
     from app.scenarios.registry import get_scenario_handlers
@@ -434,14 +445,34 @@ async def voice_incoming(scenario_id: str) -> Response:
             status_code=500,
             detail="PUBLIC_WS_BASE_URL is not configured.",
         )
+    if not settings.public_http_base_url:
+        logger.error("PUBLIC_HTTP_BASE_URL is not configured. Cannot generate TwiML XML.")
+        raise HTTPException(
+            status_code=500,
+            detail="PUBLIC_HTTP_BASE_URL is not configured.",
+        )
 
     # Construct public WebSocket URL for the scenario
     ws_base = settings.public_ws_base_url.rstrip("/")
     ws_url = f"{ws_base}/{scenario_id}"
 
-    # Build TwiML XML response
+    # Construct recording status callback URL
+    http_base = settings.public_http_base_url.rstrip("/")
+    callback_url = f"{http_base}/voice/recording-status/{scenario_id}"
+
+    # Build TwiML XML response starting recording from Call Initiation
     twiml_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+    <Start>
+        <Recording
+            channels="dual"
+            track="both"
+            trim="do-not-trim"
+            recordingStatusCallback="{callback_url}"
+            recordingStatusCallbackMethod="POST"
+            recordingStatusCallbackEvent="in-progress completed absent"
+        />
+    </Start>
     <Connect>
         <Stream url="{ws_url}" />
     </Connect>
@@ -497,6 +528,13 @@ async def recording_status_callback(
         recording_sid,
         recording_status
     )
+
+    from app.services.call_consent_registry import registry
+
+    if recording_status == "in-progress":
+        if call_sid:
+            registry.update_recording(call_sid, recording_sid, "in-progress")
+        return Response(status_code=204)
 
     async def _dispatch_recording_event():
         try:
@@ -558,7 +596,32 @@ async def recording_status_callback(
                         }
                     }
                 }
-                
+            
+            # Resolve call consent status
+            entry = registry.get(call_sid) if call_sid else None
+            if not entry:
+                logger.warning(
+                    "[Consent] Recording callback received for unknown CallSid=%s. Skipping n8n dispatch.",
+                    call_sid
+                )
+                return
+            
+            # Save recording details in registry
+            registry.update_recording(call_sid, recording_sid, recording_status)
+            
+            if entry.consent_status == "rejected":
+                logger.info(
+                    "[Consent] Recording callback processed. Consent was rejected. Skipping n8n dispatch."
+                )
+                return
+            elif entry.consent_status == "pending":
+                logger.info(
+                    "[Consent] Recording callback processed. Consent is pending. Storing pending event."
+                )
+                registry.set_pending_event(call_sid, payload)
+                return
+            
+            # Consent is accepted, send event immediately
             await send_n8n_event(event_type, payload, idempotency_key)
             
         except Exception as e:
