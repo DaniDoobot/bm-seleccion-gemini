@@ -62,8 +62,12 @@ def make_save_candidate_context_handler(
             raise ValueError("caller_user_lastname cannot be empty.")
 
         # 6. Domain value validation
-        if rgpd != "Si":
-            raise ValueError("rgpd_ok must be 'Si'.")
+        rgpd_str = str(rgpd).strip().lower() if rgpd is not None and not isinstance(rgpd, bool) else ""
+        if rgpd is True or rgpd_str in ["si", "sí", "true"]:
+            rgpd_bool = True
+        else:
+            raise ValueError("rgpd_ok must represent a valid acceptance ('Si', 'Sí' or 'True').")
+
         if scenario != expected_scenario:
             raise ValueError(f"scenario must be '{expected_scenario}'.")
 
@@ -71,7 +75,7 @@ def make_save_candidate_context_handler(
         session.candidate_context.update({
             "caller_user_name": name_str,
             "caller_user_lastname": lastname_str,
-            "rgpd_ok": rgpd,
+            "rgpd_ok": rgpd_bool,
             "scenario": scenario,
             "saved": True
         })

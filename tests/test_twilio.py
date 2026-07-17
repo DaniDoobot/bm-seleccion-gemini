@@ -390,3 +390,142 @@ def test_websocket_stream_captures_ids_but_does_not_start_recording(mock_session
     # Recording was NOT triggered because context was not saved
     assert mock_session_inst.recording_started is False
     assert mock_session_inst.recording_start_attempted is False
+
+
+# 8. conversation_id correlation and RGPD normalization tests
+from app.scenarios.common import make_save_candidate_context_handler
+
+def test_rgpd_normalization_acceptance():
+    """Verify that valid RGPD acceptances (Sí, Si, true, True) normalize to True."""
+    for val in ["Sí", "Si", "true", "True", True, "  Si  ", "sí"]:
+        session = MagicMock()
+        session.candidate_context = {"saved": False, "rgpd_ok": None}
+        session.onboarding_phase = OnboardingPhase.READY_TO_SAVE
+        session.call_sid = "CA123"
+        session.recording_start_attempted = False
+        
+        handler = make_save_candidate_context_handler(session, "seleccion_1")
+        res = handler({
+            "caller_user_name": "Daniel",
+            "caller_user_lastname": "Martínez",
+            "rgpd_ok": val,
+            "scenario": "seleccion_1"
+        })
+        assert res["success"] is True
+        assert session.candidate_context["rgpd_ok"] is True
+
+
+def test_rgpd_normalization_rejection():
+    """Verify that rejection or invalid RGPD values do not save and raise ValueError."""
+    for val in ["No", "False", False, "ninguno", ""]:
+        session = MagicMock()
+        session.candidate_context = {"saved": False, "rgpd_ok": None}
+        session.onboarding_phase = OnboardingPhase.READY_TO_SAVE
+        
+        handler = make_save_candidate_context_handler(session, "seleccion_1")
+        with pytest.raises(ValueError):
+            handler({
+                "caller_user_name": "Daniel",
+                "caller_user_lastname": "Martínez",
+                "rgpd_ok": val,
+                "scenario": "seleccion_1"
+            })
+        assert session.candidate_context.get("saved") is not True
+
+
+@patch("twilio.request_validator.RequestValidator.validate")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_conversation_id_correlation_in_audio_event(mock_send_event, mock_validate, monkeypatch):
+    """Verify that the Audio event contains conversation_id equal to call_sid."""
+    mock_validate.return_value = True
+    mock_send_event.return_value = True
+    
+    def mock_get_settings():
+        return Settings(
+            gemini_api_key="dummy-key",
+            twilio_auth_token="fake-token",
+            public_http_base_url="https://test-host.com",
+            env_file=None
+        )
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+    
+    headers = {"X-Twilio-Signature": "valid-signature"}
+    response = client.post("/voice/recording-status/seleccion_1", headers=headers, data={
+        "CallSid": "CA_CORRELATION_123",
+        "RecordingSid": "RE_CORRELATION_123",
+        "RecordingStatus": "completed",
+        "RecordingUrl": "https://api.twilio.com/recordings/RE_CORRELATION_123"
+    })
+    
+    assert response.status_code == 204
+    import time
+    time.sleep(0.1)
+    
+    mock_send_event.assert_called_once()
+    args, kwargs = mock_send_event.call_args
+    event_type, payload, idempotency_key = args
+    
+    assert payload["type"] == "Audio"
+    assert payload["data"]["conversation_id"] == "CA_CORRELATION_123"
+    assert payload["data"]["call_sid"] == "CA_CORRELATION_123"
+
+
+@patch("app.routers.voice.GeminiVoiceSession")
+@patch("app.services.n8n_events.send_n8n_event", new_callable=AsyncMock)
+def test_conversation_id_correlation_in_transcript_event(mock_send_event, mock_session_class, monkeypatch):
+    """Verify that when WebSocket closes, session.completed Transcript event is dispatched with correct conversation_id."""
+    def mock_get_settings():
+        return Settings(
+            gemini_api_key="dummy-key",
+            env_file=None
+        )
+    monkeypatch.setattr("app.routers.voice.get_settings", mock_get_settings)
+
+    mock_session_inst = MagicMock()
+    mock_session_inst.connect = AsyncMock()
+    mock_session_inst.close = AsyncMock()
+    mock_session_inst.recording_started = True
+    mock_session_inst.recording_sid = "RE_MOCK"
+    mock_session_inst.transcript = [{"sequence": 1, "speaker": "candidate", "text": "Hola", "phase": "onboarding"}]
+    mock_session_inst.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+    mock_session_inst.candidate_context = {
+        "saved": True,
+        "caller_user_name": "Daniel",
+        "caller_user_lastname": "Martínez",
+        "rgpd_ok": True
+    }
+
+    async def mock_receive():
+        yield {"type": "setup_complete"}
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+
+    mock_session_inst.receive = mock_receive
+    mock_session_class.return_value = mock_session_inst
+
+    with client.websocket_connect("/voice/stream?scenario=seleccion_1") as websocket:
+        websocket.send_json({"event": "connected", "protocol": "Call", "version": "1.0.0"})
+        websocket.send_json({
+            "event": "start",
+            "start": {
+                "accountSid": "AC_TEST",
+                "streamSid": "MZ_TEST",
+                "callSid": "CA_TRANSCRIPT_123"
+            }
+        })
+        import time
+        time.sleep(0.1)
+    
+    time.sleep(0.1)
+    
+    mock_send_event.assert_called_once()
+    args, kwargs = mock_send_event.call_args
+    event_type, payload, idempotency_key = args
+    
+    assert payload["type"] == "Transcript"
+    assert payload["data"]["conversation_id"] == "CA_TRANSCRIPT_123"
+    assert payload["data"]["call_sid"] == "CA_TRANSCRIPT_123"
+    assert payload["data"]["candidate"]["rgpd_ok"] is True
+

@@ -142,7 +142,7 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
             return
         session_completed_sent = True
 
-        rgpd_ok = gemini_session.candidate_context.get("rgpd_ok") == "Si"
+        rgpd_ok = gemini_session.candidate_context.get("rgpd_ok") is True
         if not rgpd_ok:
             logger.info("RGPD consent was not given. Skipping session.completed event dispatch.")
             return
@@ -193,6 +193,7 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
             "event_id": f"session.completed:{gemini_session.call_sid}",
             "data": {
                 "agent_id": scenario_config.evaluation_agent_id,
+                "conversation_id": gemini_session.call_sid or "",
                 "call_sid": gemini_session.call_sid or "",
                 "stream_sid": gemini_session.stream_sid or "",
                 "scenario_id": scenario_config.scenario_id,
@@ -470,6 +471,7 @@ async def recording_status_callback(
                     "event_id": f"{event_type}:{recording_sid}",
                     "data": {
                         "agent_id": scenario_config.evaluation_agent_id,
+                        "conversation_id": call_sid,
                         "call_sid": call_sid,
                         "scenario_id": scenario_id,
                         "external_scenario_id": scenario_config.external_scenario_id,
@@ -500,6 +502,7 @@ async def recording_status_callback(
                     "event_id": f"{event_type}:{recording_sid}",
                     "data": {
                         "agent_id": scenario_config.evaluation_agent_id,
+                        "conversation_id": call_sid,
                         "call_sid": call_sid,
                         "scenario_id": scenario_id,
                         "external_scenario_id": scenario_config.external_scenario_id,
