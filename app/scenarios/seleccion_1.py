@@ -121,4 +121,5 @@ SELECCION_1_CONFIG = ScenarioConfig(
     roleplay_transition_phrase="Perfecto, comenzamos la simulación. A partir de ahora soy el paciente.",
     roleplay_initial_phrase="Mira, quiero hablar con el doctor ahora mismo.",
     completion_phrase="La prueba ha terminado. Gracias por participar.",
+    evaluation_agent_id="agent_3801kjcvpbseek68yv7hypkyhb7z",
 )

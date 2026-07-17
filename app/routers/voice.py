@@ -23,11 +23,12 @@ What this router does NOT handle in Phase 1:
   - Post-call logic.
 """
 import asyncio
+import datetime
 import json
 import logging
 
 import websockets.exceptions
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, Response, HTTPException
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, Response, HTTPException, Request
 
 from app.config import get_settings
 from app.core.audio import decode_twilio_to_gemini, encode_gemini_to_twilio
@@ -65,9 +66,11 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
 
     # ── 2. Wait for Twilio 'start' event ─────────────────────────────────────
     stream_sid: str = ""
+    call_sid: str = ""
+    account_sid: str = ""
     try:
         async def _wait_for_start() -> None:
-            nonlocal stream_sid
+            nonlocal stream_sid, call_sid, account_sid
             async for message in websocket.iter_text():
                 data = json.loads(message)
                 event = data.get("event")
@@ -77,8 +80,10 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                 if event == "start":
                     start_data = data.get("start", {})
                     stream_sid = start_data.get("streamSid", "")
+                    call_sid = start_data.get("callSid", "")
+                    account_sid = start_data.get("accountSid", "")
                     logger.info(
-                        "Twilio stream started. stream_sid=%s", stream_sid
+                        "Twilio stream started. stream_sid=%s, call_sid=%s", stream_sid, call_sid
                     )
                     return
                 logger.debug("Ignoring pre-start Twilio event: %s", event)
@@ -104,6 +109,13 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
         completion_phrase=scenario_config.completion_phrase,
     )
 
+    # Store integration variables in session
+    gemini_session.call_sid = call_sid
+    gemini_session.stream_sid = stream_sid
+    gemini_session.twilio_account_sid = account_sid
+    gemini_session.scenario_id = scenario_config.scenario_id
+    gemini_session._started_at_dt = datetime.datetime.now(datetime.timezone.utc)
+
     # Register scenario tool handlers
     from app.scenarios.registry import get_scenario_handlers
     handlers = get_scenario_handlers(scenario_config.scenario_id, gemini_session)
@@ -120,6 +132,92 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
         logger.error("Failed to connect to Gemini Live: %s", exc)
         await websocket.close()
         return
+
+    session_completed_sent = False
+    was_failed = False
+
+    async def send_session_completed_event():
+        nonlocal session_completed_sent
+        if session_completed_sent:
+            return
+        session_completed_sent = True
+
+        rgpd_ok = gemini_session.candidate_context.get("rgpd_ok") == "Si"
+        if not rgpd_ok:
+            logger.info("RGPD consent was not given. Skipping session.completed event dispatch.")
+            return
+
+        candidate_data = {
+            "name": gemini_session.candidate_context.get("caller_user_name"),
+            "lastname": gemini_session.candidate_context.get("caller_user_lastname"),
+            "rgpd_ok": True
+        }
+
+        if was_failed:
+            status = "failed"
+            completion_reason = "gemini_error"
+        else:
+            is_finished = gemini_session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED
+            status = "completed" if is_finished else "disconnected"
+            completion_reason = "roleplay_finished" if is_finished else "caller_disconnected"
+
+        started_at_dt = getattr(gemini_session, "_started_at_dt", None)
+        if started_at_dt:
+            finished_at_dt = datetime.datetime.now(datetime.timezone.utc)
+            duration_seconds = int((finished_at_dt - started_at_dt).total_seconds())
+            started_at_str = started_at_dt.isoformat()
+            finished_at_str = finished_at_dt.isoformat()
+        else:
+            started_at_str = ""
+            finished_at_str = ""
+            duration_seconds = 0
+
+        session_data = {
+            "status": status,
+            "roleplay_finished": gemini_session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED,
+            "completion_reason": completion_reason,
+            "started_at": started_at_str,
+            "finished_at": finished_at_str,
+            "duration_seconds": duration_seconds
+        }
+
+        recording_data = {
+            "started": gemini_session.recording_started,
+            "recording_sid": gemini_session.recording_sid or "",
+            "status": "in_progress" if gemini_session.recording_started else "none"
+        }
+
+        event_payload = {
+            "type": "Transcript",
+            "event_type": "session.completed",
+            "event_id": f"session.completed:{gemini_session.call_sid}",
+            "data": {
+                "agent_id": scenario_config.evaluation_agent_id,
+                "call_sid": gemini_session.call_sid or "",
+                "stream_sid": gemini_session.stream_sid or "",
+                "scenario_id": scenario_config.scenario_id,
+                "external_scenario_id": scenario_config.external_scenario_id,
+                "candidate": candidate_data,
+                "session": session_data,
+                "recording": recording_data,
+                "transcript": gemini_session.transcript
+            }
+        }
+
+        from app.services.n8n_events import send_n8n_event
+        idempotency_key = f"session.completed:{gemini_session.call_sid}"
+        
+        async def _dispatch_to_n8n():
+            try:
+                await send_n8n_event("Transcript", event_payload, idempotency_key)
+            except Exception as e:
+                logger.error("Error sending transcript event to n8n: %s", e)
+
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(_dispatch_to_n8n())
+        except RuntimeError:
+            asyncio.run(_dispatch_to_n8n())
 
     try:
         # Resampler states (threaded across consecutive audio chunks)
@@ -235,8 +333,14 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
 
     except Exception as exc:
         logger.error("Unexpected error in voice_stream: %s", exc)
+        was_failed = True
 
     finally:
+        try:
+            await send_session_completed_event()
+        except Exception as exc:
+            logger.error("Failed to send session completed event: %s", exc)
+
         await gemini_session.close()
         try:
             await websocket.close()
@@ -276,12 +380,7 @@ async def voice_stream_path(
     summary="Twilio incoming call webhook",
 )
 async def voice_incoming(scenario_id: str) -> Response:
-    """TwiML response to connect Twilio call to the scenario's WebSocket stream.
-
-    Supports both GET and POST requests.
-    Returns 404 if the scenario does not exist.
-    Returns 500 if PUBLIC_WS_BASE_URL is not configured.
-    """
+    """TwiML response to connect Twilio call to the scenario's WebSocket stream."""
     scenario_config = get_scenario(scenario_id)
     if scenario_config is None:
         logger.warning("Incoming call request for unknown scenario: %s", scenario_id)
@@ -309,3 +408,124 @@ async def voice_incoming(scenario_id: str) -> Response:
 </Response>"""
 
     return Response(content=twiml_xml, media_type="application/xml")
+
+
+@router.post("/voice/recording-status/{scenario_id}")
+async def recording_status_callback(
+    scenario_id: str,
+    request: Request,
+) -> Response:
+    """Twilio callback received when call recording is completed or absent."""
+    settings = get_settings()
+
+    # 1. Resolve scenario first
+    scenario_config = get_scenario(scenario_id)
+    if scenario_config is None:
+        logger.warning("Recording status callback for unknown scenario: %s", scenario_id)
+        raise HTTPException(status_code=404, detail="Scenario not found")
+
+    # 2. Twilio Signature Validation
+    signature = request.headers.get("X-Twilio-Signature")
+    form_data = await request.form()
+    params = dict(form_data)
+
+    if not settings.twilio_auth_token:
+        logger.error("TWILIO_AUTH_TOKEN is not configured. Cannot validate signature.")
+        raise HTTPException(status_code=403, detail="Twilio auth token not configured")
+
+    if not settings.public_http_base_url:
+        logger.error("PUBLIC_HTTP_BASE_URL is not configured. Cannot validate signature URL.")
+        raise HTTPException(status_code=403, detail="Public HTTP base URL not configured")
+
+    url = f"{settings.public_http_base_url.rstrip('/')}/voice/recording-status/{scenario_id}"
+
+    from twilio.request_validator import RequestValidator
+    validator = RequestValidator(settings.twilio_auth_token)
+    if not validator.validate(url, params, signature):
+        logger.warning("Twilio signature validation failed for recording callback.")
+        raise HTTPException(status_code=403, detail="Invalid Twilio signature")
+
+    # Signature is valid! Return 204 immediately and dispatch event in background
+    recording_status = params.get("RecordingStatus")
+    call_sid = params.get("CallSid")
+    recording_sid = params.get("RecordingSid")
+
+    logger.info(
+        "Twilio recording callback signature validated. CallSid=%s, RecordingSid=%s, Status=%s",
+        call_sid,
+        recording_sid,
+        recording_status
+    )
+
+    async def _dispatch_recording_event():
+        try:
+            from app.services.n8n_events import send_n8n_event
+            
+            if recording_status == "absent":
+                event_type = "recording.absent"
+                idempotency_key = f"recording.absent:{recording_sid}"
+                payload = {
+                    "type": "Audio",
+                    "event_type": event_type,
+                    "event_id": f"{event_type}:{recording_sid}",
+                    "data": {
+                        "agent_id": scenario_config.evaluation_agent_id,
+                        "call_sid": call_sid,
+                        "scenario_id": scenario_id,
+                        "external_scenario_id": scenario_config.external_scenario_id,
+                        "recording": {
+                            "recording_sid": recording_sid,
+                            "status": "absent"
+                        }
+                    }
+                }
+            else:
+                event_type = "recording.completed"
+                idempotency_key = f"recording.completed:{recording_sid}"
+                
+                # Safe casting duration
+                try:
+                    duration = int(float(params.get("RecordingDuration", 0)))
+                except (ValueError, TypeError):
+                    duration = 0
+                    
+                try:
+                    channels = int(params.get("RecordingChannels", 2))
+                except (ValueError, TypeError):
+                    channels = 2
+
+                payload = {
+                    "type": "Audio",
+                    "event_type": event_type,
+                    "event_id": f"{event_type}:{recording_sid}",
+                    "data": {
+                        "agent_id": scenario_config.evaluation_agent_id,
+                        "call_sid": call_sid,
+                        "scenario_id": scenario_id,
+                        "external_scenario_id": scenario_config.external_scenario_id,
+                        "recording": {
+                            "recording_sid": recording_sid,
+                            "status": "completed",
+                            "url": params.get("RecordingUrl"),
+                            "duration_seconds": duration,
+                            "channels": channels,
+                            "track": params.get("RecordingTrack", "both"),
+                            "started_at": params.get("RecordingStartTime"),
+                            "source": params.get("RecordingSource", "StartCallRecordingAPI")
+                        }
+                    }
+                }
+                
+            await send_n8n_event(event_type, payload, idempotency_key)
+            
+        except Exception as e:
+            logger.error("Error dispatching recording event to n8n: %s", e)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_dispatch_recording_event())
+    except RuntimeError:
+        asyncio.run(_dispatch_recording_event())
+
+    return Response(status_code=204)
+

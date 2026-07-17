@@ -32,12 +32,25 @@ class Settings(BaseSettings):
     port: int = 8000
     public_url: str = ""
     public_ws_base_url: str = ""
+    public_http_base_url: str = ""
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: str = "*"
 
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
+
+    # ── Twilio ────────────────────────────────────────────────────────────────
+    twilio_account_sid: str = ""
+    twilio_auth_token: str = ""
+
+    # ── n8n ───────────────────────────────────────────────────────────────────
+    n8n_events_webhook_url: str = ""
+    n8n_webhook_token: str = ""
+
+    # ── Flags ─────────────────────────────────────────────────────────────────
+    call_recording_enabled: bool = True
+    gemini_transcription_enabled: bool = True
 
     @property
     def allowed_origins(self) -> List[str]:

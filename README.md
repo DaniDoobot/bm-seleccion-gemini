@@ -135,6 +135,9 @@ Variables configurables (con valores por defecto validados):
 | `CORS_ORIGINS` | `*` | Orígenes CORS permitidos |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
 | `PUBLIC_WS_BASE_URL` | | URL base pública de WebSocket para la integración con Twilio |
+| `TWILIO_ACCOUNT_SID` | | Account SID de Twilio para grabación programática |
+| `TWILIO_AUTH_TOKEN` | | Auth Token de Twilio |
+| `N8N_WEBHOOK_URL` | | URL del webhook de n8n para enviar resultados de la simulación |
 
 ---
 

@@ -77,6 +77,37 @@ def make_save_candidate_context_handler(
         })
         session.onboarding_phase = OnboardingPhase.CONTEXT_SAVED
 
+        # Start call recording if call_sid is present, enabled, and not yet started
+        call_sid = getattr(session, "call_sid", None)
+        if call_sid and not getattr(session, "recording_start_attempted", False):
+            session.recording_start_attempted = True
+            import asyncio
+            from app.services.twilio_recording import start_twilio_recording
+
+            async def _bg_record():
+                try:
+                    logger.info("Triggering background Twilio recording. CallSid=%s", call_sid)
+                    scenario_id = getattr(session, "scenario_id", "seleccion_1")
+                    rec_sid = start_twilio_recording(call_sid, scenario_id)
+                    if rec_sid:
+                        session.recording_sid = rec_sid
+                        session.recording_started = True
+                        session.recording_status = "in_progress"
+                        logger.info("Recording started in background task. RecordingSid=%s", rec_sid)
+                    else:
+                        session.recording_error = "failed_to_start"
+                        logger.warning("Recording start in background failed for CallSid=%s", call_sid)
+                except Exception as e:
+                    logger.error("Error starting recording in background task: %s", e)
+
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_bg_record())
+            except RuntimeError:
+                # No running event loop (e.g. during unit tests)
+                asyncio.run(_bg_record())
+
+
         # 7. Safe logging (masking personal names to protect privacy)
         masked_name = name_str[0] + "*" * (len(name_str) - 1) if name_str else ""
         masked_lastname = lastname_str[0] + "*" * (len(lastname_str) - 1) if lastname_str else ""

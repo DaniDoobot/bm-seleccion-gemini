@@ -62,7 +62,7 @@ class GeminiVoiceSession:
         self._settings = settings
         self._system_instruction = system_instruction
         self._tools = tools or []
-        self._enable_transcription = enable_transcription
+        self._enable_transcription = settings.gemini_transcription_enabled
         self._roleplay_transition_phrase = roleplay_transition_phrase
         self._roleplay_initial_phrase = roleplay_initial_phrase
         self._completion_phrase = completion_phrase
@@ -85,8 +85,21 @@ class GeminiVoiceSession:
         self.provisional_name = None
         self.provisional_lastname = None
 
+        # Call recording / integration fields
+        self.call_sid: Optional[str] = None
+        self.stream_sid: Optional[str] = None
+        self.twilio_account_sid: Optional[str] = None
+        self.recording_sid: Optional[str] = None
+        self.recording_started: bool = False
+        self.recording_start_attempted: bool = False
+        self.recording_status: str = "none"
+        self.recording_error: Optional[str] = None
+
+        self.transcript: List[Dict[str, Any]] = []
+
         self._user_transcript_accumulator = ""
         self._model_transcript_accumulator = ""
+
 
     # ── Onboarding State Machine Transitions ──────────────────────────────────
 
@@ -361,6 +374,27 @@ class GeminiVoiceSession:
         await self._ws.send(json.dumps(msg))
         logger.debug("Sent toolResponse for %s (id: %s)", name, call_id)
 
+    def add_transcript_turn(self, speaker: str, text: str) -> None:
+        """Add a consolidated turn to the in-memory transcript."""
+        import datetime
+        
+        clean_text = text.strip()
+        if not clean_text:
+            return
+        
+        # Calculate phase: "roleplay" if phase is active/finished, otherwise "onboarding"
+        is_roleplay = self.onboarding_phase in [OnboardingPhase.ROLEPLAY_ACTIVE, OnboardingPhase.ROLEPLAY_FINISHED]
+        phase = "roleplay" if is_roleplay else "onboarding"
+        
+        self.transcript.append({
+            "sequence": len(self.transcript) + 1,
+            "speaker": speaker,
+            "phase": phase,
+            "text": clean_text,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        })
+
+
     async def receive(self) -> AsyncIterator[dict]:
         """Yield normalized event dicts from the Gemini WebSocket.
 
@@ -405,6 +439,9 @@ class GeminiVoiceSession:
                 model_turn = content.get("modelTurn")
                 if model_turn:
                     # Model starts responding, clear user transcript accumulator
+                    user_text = self._user_transcript_accumulator.strip()
+                    if user_text:
+                        self.add_transcript_turn("candidate", user_text)
                     self._user_transcript_accumulator = ""
                     for part in model_turn.get("parts", []):
                         # Spoken Audio
@@ -444,6 +481,11 @@ class GeminiVoiceSession:
                 # Model signals that its turn is complete
                 if content.get("turnComplete"):
                     logger.debug("Gemini turn complete.")
+                    # Consolidated turn save for model/patient:
+                    model_text = self._model_transcript_accumulator.strip()
+                    if model_text:
+                        self.add_transcript_turn("patient", model_text)
+
                     # Check transition to ROLEPLAY_ACTIVE at turnComplete
                     if self.onboarding_phase == OnboardingPhase.READY_TO_START_ROLEPLAY:
                         norm_accumulated = self._normalize_text(self._model_transcript_accumulator)
@@ -467,6 +509,7 @@ class GeminiVoiceSession:
                     yield {"type": "turn_complete"}
 
             # ── Tool calls ────────────────────────────────────────────────────
+
             elif GEMINI_TOOL_CALL in data:
                 tool_call = data[GEMINI_TOOL_CALL]
                 function_calls = tool_call.get("functionCalls", [])

@@ -36,3 +36,4 @@ class ScenarioConfig:
     roleplay_transition_phrase: str = "Perfecto, comenzamos la simulación. A partir de ahora soy el paciente."
     roleplay_initial_phrase: str = ""
     completion_phrase: str = "La prueba ha terminado. Gracias por participar."
+    evaluation_agent_id: str = ""
