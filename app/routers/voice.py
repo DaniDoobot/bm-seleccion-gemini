@@ -127,6 +127,18 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
     gemini_session.recording_start_attempted = True
     gemini_session.recording_status = "requested"
 
+    # Register callback for clearing Twilio buffer during silence reminder interruptions
+    async def clear_twilio_buffer():
+        if stream_sid:
+            logger.info("Local VAD clearing Twilio buffer. stream_sid=%s", stream_sid)
+            clear_msg = {
+                "event": "clear",
+                "streamSid": stream_sid,
+            }
+            await websocket.send_text(json.dumps(clear_msg))
+            
+    gemini_session.on_twilio_clear = clear_twilio_buffer
+
     # Register scenario tool handlers
     from app.scenarios.registry import get_scenario_handlers
     handlers = get_scenario_handlers(scenario_config.scenario_id, gemini_session)
@@ -251,11 +263,30 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             continue
                         payload = data.get("media", {}).get("payload")
                         if payload:
+                            # Decode and run local VAD (Voice Activity Detection) on incoming audio
+                            try:
+                                import base64
+                                mulaw_bytes = base64.b64decode(payload)
+                                try:
+                                    import audioop
+                                except ImportError:
+                                    import audioop_lts as audioop
+                                pcm_8k = audioop.ulaw2lin(mulaw_bytes, 2)
+                                gemini_session.process_input_audio_for_vad(pcm_8k)
+                            except Exception as vad_err:
+                                logger.error("VAD processing error: %s", vad_err)
+
                             pcm_16k_b64, twilio_rate_state = decode_twilio_to_gemini(
                                 payload, twilio_rate_state
                             )
                             if pcm_16k_b64:
                                 await gemini_session.send_audio(pcm_16k_b64)
+
+                    elif event == "mark":
+                        mark_data = data.get("mark", {})
+                        mark_name = mark_data.get("name", "")
+                        logger.info("Received mark event from Twilio: %s", mark_name)
+                        await gemini_session.handle_twilio_mark(mark_name)
 
                     elif event == "stop":
                         logger.info("Twilio stream stopped.")
@@ -288,6 +319,22 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             )
 
                     elif event_type == "audio":
+                        # Set model speaking state
+                        gemini_session.model_speaking = True
+                        gemini_session.awaiting_user_response = False
+
+                        # Measure latency on first audio frame after user speech ended
+                        if getattr(gemini_session, "user_speech_ended_at", None) is not None and getattr(gemini_session, "first_model_audio_at", None) is None:
+                            import time
+                            gemini_session.first_model_audio_at = time.monotonic()
+                            latency_s = gemini_session.first_model_audio_at - gemini_session.user_speech_ended_at
+                            gemini_session.response_latency_ms = int(latency_s * 1000)
+                            logger.info(
+                                "First Gemini audio after user speech. call_sid=%s latency_ms=%d",
+                                gemini_session._mask_sid(gemini_session.call_sid),
+                                gemini_session.response_latency_ms
+                            )
+
                         mulaw_b64, gemini_rate_state = encode_gemini_to_twilio(
                             event_data["data"], gemini_rate_state
                         )
@@ -300,6 +347,9 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             await websocket.send_text(json.dumps(media_msg))
 
                     elif event_type == "interrupted":
+                        # Reset model speaking and silence reminder active status
+                        gemini_session.model_speaking = False
+                        gemini_session.silence_reminder_active = False
                         # Barge-in: clear Twilio's audio playback buffer
                         if stream_sid:
                             logger.info(
@@ -321,6 +371,27 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             )
                             await asyncio.sleep(1.5)
                             break
+
+                        # Send turn completion mark to Twilio to track bot playback completion
+                        gemini_session.bot_turn_counter += 1
+                        turn_id = gemini_session.bot_turn_counter
+                        mark_name = f"bot_turn_end:{turn_id}"
+                        gemini_session.twilio_playback_mark = mark_name
+
+                        if stream_sid:
+                            mark_msg = {
+                                "event": "mark",
+                                "streamSid": stream_sid,
+                                "mark": {
+                                    "name": mark_name
+                                }
+                            }
+                            await websocket.send_text(json.dumps(mark_msg))
+                            logger.info(
+                                "Sent bot turn end mark to Twilio. call_sid=%s mark=%s",
+                                gemini_session._mask_sid(gemini_session.call_sid),
+                                mark_name
+                            )
 
                     elif event_type == "unknown":
                         logger.debug(

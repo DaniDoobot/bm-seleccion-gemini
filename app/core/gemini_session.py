@@ -102,6 +102,36 @@ class GeminiVoiceSession:
         self._user_transcript_accumulator = ""
         self._model_transcript_accumulator = ""
 
+        # Silence reminder & VAD control fields
+        self.awaiting_user_response: bool = False
+        self.user_speaking: bool = False
+        self.model_speaking: bool = False
+
+        self.last_user_voice_at: Optional[float] = None
+        self.bot_playback_completed_at: Optional[float] = None
+
+        self.silence_watch_task: Optional[asyncio.Task] = None
+        self.silence_watch_generation: int = 0
+        self.silence_reminder_sent: bool = False
+        self.silence_reminder_active: bool = False
+        self.silence_reminder_index: int = 0
+
+        self.twilio_playback_mark: Optional[str] = None
+        self.bot_turn_counter: int = 0
+
+        # Local VAD accumulator variables
+        self._vad_consecutive_active_frames = 0
+        self._vad_speech_start_time = None
+        self._vad_last_active_time = None
+
+        # Reconnection state indicator
+        self._reconnecting = False
+
+        # Latency metric variables
+        self.user_speech_ended_at = None
+        self.first_model_audio_at = None
+        self.response_latency_ms = None
+
 
     # ── Onboarding State Machine Transitions ──────────────────────────────────
 
@@ -787,10 +817,10 @@ class GeminiVoiceSession:
             "realtimeInputConfig": {
                 "automaticActivityDetection": {
                     "disabled": False,
-                    "startOfSpeechSensitivity": "START_SENSITIVITY_LOW",
-                    "endOfSpeechSensitivity": "END_SENSITIVITY_HIGH",
-                    "prefixPaddingMs": s.vad_prefix_padding_ms,
-                    "silenceDurationMs": s.vad_silence_duration_ms,
+                    "startOfSpeechSensitivity": "START_SENSITIVITY_HIGH",
+                    "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                    "prefixPaddingMs": s.gemini_vad_prefix_padding_ms,
+                    "silenceDurationMs": s.gemini_vad_silence_duration_ms,
                 },
                 "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY",
                 "activityHandling": "START_OF_ACTIVITY_INTERRUPTS",
@@ -815,3 +845,211 @@ class GeminiVoiceSession:
         setup = self._build_setup_message()
         await self._ws.send(json.dumps(setup))
         logger.debug("Gemini setup message sent.")
+
+    # ── Silence Watch, Local VAD & Twilio Marks ────────────────────────────────
+
+    def _mask_sid(self, sid: Optional[str]) -> str:
+        """Mask Twilio SIDs to protect candidate privacy in logs."""
+        if not sid:
+            return "None"
+        if len(sid) <= 6:
+            return sid
+        return sid[:3] + "..." + sid[-3:]
+
+    def process_input_audio_for_vad(self, pcm_8k: bytes) -> None:
+        """Process incoming 8kHz PCM16 audio for voice activity detection."""
+        # Check active session conditions
+        if self.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED:
+            return
+        if self.candidate_context.get("rgpd_ok") is False:
+            return
+        if getattr(self, "_reconnecting", False):
+            return
+
+        import audioop
+        import time
+
+        try:
+            rms = audioop.rms(pcm_8k, 2)
+        except Exception:
+            return
+
+        threshold = self._settings.user_speech_rms_threshold
+        now = time.monotonic()
+
+        is_frame_active = (rms > threshold)
+
+        if is_frame_active:
+            self._vad_last_active_time = now
+            self._vad_consecutive_active_frames += 1
+
+            if self._vad_speech_start_time is None:
+                self._vad_speech_start_time = now
+
+            active_duration_ms = (now - self._vad_speech_start_time) * 1000
+            if active_duration_ms >= self._settings.user_speech_min_active_ms:
+                if not self.user_speaking:
+                    self.on_user_speech_start()
+        else:
+            if self.user_speaking:
+                if self._vad_last_active_time is not None:
+                    inactive_duration_ms = (now - self._vad_last_active_time) * 1000
+                    if inactive_duration_ms >= self._settings.user_speech_hangover_ms:
+                        self.on_user_speech_end()
+            else:
+                if self._vad_last_active_time is not None:
+                    inactive_duration_ms = (now - self._vad_last_active_time) * 1000
+                    if inactive_duration_ms >= self._settings.user_speech_hangover_ms:
+                        self._vad_speech_start_time = None
+                        self._vad_consecutive_active_frames = 0
+                else:
+                    self._vad_speech_start_time = None
+                    self._vad_consecutive_active_frames = 0
+
+    def on_user_speech_start(self) -> None:
+        """Callback triggered when local VAD confirms user has started speaking."""
+        import time
+        logger.info("User speech started. call_sid=%s", self._mask_sid(self.call_sid))
+        self.user_speaking = True
+        self.awaiting_user_response = False
+        self.last_user_voice_at = time.monotonic()
+
+        # Increment generation to invalidate any pending silence watch tasks
+        self.silence_watch_generation += 1
+
+        # Cancel current silence watch task
+        if self.silence_watch_task and not self.silence_watch_task.done():
+            self.silence_watch_task.cancel()
+            logger.info("Silence watch cancelled by user speech. call_sid=%s", self._mask_sid(self.call_sid))
+
+        self.silence_reminder_sent = False
+
+        # Interrupt silence reminder playback if it was active
+        if self.silence_reminder_active:
+            self.silence_reminder_active = False
+            if hasattr(self, "on_twilio_clear") and self.on_twilio_clear:
+                try:
+                    import asyncio
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self.on_twilio_clear())
+                except Exception as e:
+                    logger.error("Error calling on_twilio_clear: %s", e)
+
+    def on_user_speech_end(self) -> None:
+        """Callback triggered when local VAD confirms user has finished speaking."""
+        import time
+        logger.info("User speech ended. call_sid=%s", self._mask_sid(self.call_sid))
+        self.user_speaking = False
+        self.last_user_voice_at = time.monotonic()
+
+        # Store user speech end timestamp for response latency metrics
+        self.user_speech_ended_at = time.monotonic()
+        self.first_model_audio_at = None
+        self.response_latency_ms = None
+
+    async def handle_twilio_mark(self, mark_name: str) -> None:
+        """Handle Twilio mark event indicating bot playback completed."""
+        import time
+        if self.twilio_playback_mark == mark_name:
+            logger.info("Bot playback completed. call_sid=%s mark=%s", self._mask_sid(self.call_sid), mark_name)
+            
+            # Prevent starting reminder in finished/closed/reconnecting scenarios
+            if (self.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED or 
+                self.candidate_context.get("rgpd_ok") is False or 
+                getattr(self, "_reconnecting", False) or 
+                not self.stream_sid or 
+                not self._ready):
+                self.model_speaking = False
+                return
+
+            if not self.user_speaking:
+                self.model_speaking = False
+                self.awaiting_user_response = True
+                self.bot_playback_completed_at = time.monotonic()
+                self.silence_reminder_sent = False
+                self.silence_reminder_active = False
+                self.user_speech_ended_at = None
+
+                await self.start_silence_watch()
+            else:
+                logger.info("Mark received but user is already speaking. Skipping silence watch.")
+
+    async def start_silence_watch(self) -> None:
+        """Start the silence watch timer in a background task."""
+        if self.silence_watch_task and not self.silence_watch_task.done():
+            self.silence_watch_task.cancel()
+
+        self.silence_watch_generation += 1
+        current_gen = self.silence_watch_generation
+
+        logger.info(
+            "Silence watch started. call_sid=%s timeout=%s",
+            self._mask_sid(self.call_sid),
+            self._settings.silence_reminder_seconds
+        )
+
+        async def _watch():
+            try:
+                await asyncio.sleep(self._settings.silence_reminder_seconds)
+                import time
+                now = time.monotonic()
+                elapsed = now - (self.bot_playback_completed_at or 0)
+
+                if (current_gen == self.silence_watch_generation and
+                    self.awaiting_user_response and
+                    not self.user_speaking and
+                    not self.model_speaking and
+                    not self.silence_reminder_sent and
+                    not self.silence_reminder_active and
+                    self.onboarding_phase != OnboardingPhase.ROLEPLAY_FINISHED and
+                    self.candidate_context.get("rgpd_ok") is not False and
+                    not getattr(self, "_reconnecting", False) and
+                    self.stream_sid and
+                    self._ready and
+                    (5.0 <= elapsed <= 6.5 if self._settings.silence_reminder_seconds == 5.5 else (self._settings.silence_reminder_seconds - 0.5) <= elapsed <= (self._settings.silence_reminder_seconds + 1.0))):
+
+                    logger.info(
+                        "Silence reminder triggered. call_sid=%s elapsed_ms=%d",
+                        self._mask_sid(self.call_sid),
+                        int(elapsed * 1000)
+                    )
+                    await self.trigger_silence_reminder()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.error("Error in silence watch task: %s", e)
+
+        self.silence_watch_task = asyncio.create_task(_watch())
+
+    async def trigger_silence_reminder(self) -> None:
+        """Alternates deterministically between three silence reminders using circular indexing."""
+        phrases = [
+            "Oye, ¿sigues ahí?",
+            "¿Puedes oírme? No te escucho.",
+            "¿Todavía sigues ahí?"
+        ]
+        phrase = phrases[self.silence_reminder_index]
+        self.silence_reminder_index = (self.silence_reminder_index + 1) % len(phrases)
+
+        self.silence_reminder_sent = True
+        self.silence_reminder_active = True
+        self.model_speaking = True
+        self.awaiting_user_response = False
+
+        instruction = (
+            "CONTROL INTERNO DE LLAMADA:\n"
+            "El interlocutor lleva 5,5 segundos sin responder.\n"
+            f"Pronuncia únicamente esta frase:\n"
+            f"\"{phrase}\"\n"
+            "No avances ninguna fase.\n"
+            "No respondas en nombre del candidato.\n"
+            "No repitas el onboarding.\n"
+            "No repitas la pregunta anterior.\n"
+            "Después de pronunciarla, vuelve a esperar al interlocutor."
+        )
+
+        try:
+            logger.info("Sending silence reminder instruction: '%s'", phrase)
+            await self.send_text_turn(instruction)
+        except Exception as e:
+            logger.error("Error sending silence reminder: %s", e)

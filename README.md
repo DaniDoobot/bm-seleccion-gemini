@@ -131,6 +131,14 @@ Variables configurables (con valores por defecto validados):
 | `GEMINI_THINKING_LEVEL` | `minimal` | Nivel de razonamiento interno |
 | `VAD_SILENCE_DURATION_MS` | `130` | Silencio para fin de turno (ms) |
 | `VAD_PREFIX_PADDING_MS` | `120` | Relleno de inicio de habla (ms) |
+| `SILENCE_REMINDER_ENABLED` | `true` | Activa recordatorios de silencio cuando el candidato no responde |
+| `SILENCE_REMINDER_SECONDS` | `5.5` | Tiempo en segundos de espera antes del recordatorio |
+| `SILENCE_REMINDER_MAX_PER_WAIT` | `1` | Límite máximo de recordatorios por cada turno de espera |
+| `USER_SPEECH_RMS_THRESHOLD` | `450` | Umbral de potencia RMS para detectar habla local del usuario |
+| `USER_SPEECH_MIN_ACTIVE_MS` | `120` | Duración mínima de habla activa (ms) para confirmar voz |
+| `USER_SPEECH_HANGOVER_MS` | `250` | Periodo de mantenimiento (ms) tras silencio para confirmar fin de voz |
+| `GEMINI_VAD_PREFIX_PADDING_MS` | `20` | Relleno VAD configurado en Gemini setup |
+| `GEMINI_VAD_SILENCE_DURATION_MS` | `700` | Silencio VAD en Gemini setup (ms) |
 | `PORT` | `8000` | Puerto del servidor |
 | `CORS_ORIGINS` | `*` | Orígenes CORS permitidos |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |

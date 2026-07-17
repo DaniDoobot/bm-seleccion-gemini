@@ -1233,6 +1233,178 @@ def test_completed_callback_unknown_call_sid(mock_n8n, mock_validate, monkeypatc
     mock_n8n.assert_not_called()
 
 
+# ── 12. Silence Reminder & Local VAD tests
+
+def test_gemini_setup_contains_vad_configuration():
+    """Verify Gemini setup message has startOfSpeechSensitivity, endOfSpeechSensitivity, and configured silenceDurationMs."""
+    settings = Settings(
+        gemini_vad_prefix_padding_ms=25,
+        gemini_vad_silence_duration_ms=750,
+        env_file=None
+    )
+    session = GeminiVoiceSession(settings=settings, system_instruction="system")
+    setup_msg = session._build_setup_message()
+    
+    realtime_config = setup_msg["setup"]["realtimeInputConfig"]
+    vad_config = realtime_config["automaticActivityDetection"]
+    
+    assert vad_config["startOfSpeechSensitivity"] == "START_SENSITIVITY_HIGH"
+    assert vad_config["endOfSpeechSensitivity"] == "END_SENSITIVITY_LOW"
+    assert vad_config["prefixPaddingMs"] == 25
+    assert vad_config["silenceDurationMs"] == 750
+    assert realtime_config["activityHandling"] == "START_OF_ACTIVITY_INTERRUPTS"
+    assert realtime_config["turnCoverage"] == "TURN_INCLUDES_ONLY_ACTIVITY"
+
+
+@pytest.mark.asyncio
+async def test_silence_watch_timers_and_triggers():
+    """Test timer trigger timing, start constraints, and cancellation scenarios."""
+    settings = Settings(
+        silence_reminder_enabled=True,
+        silence_reminder_seconds=0.1,  # Short timeout for testing
+        env_file=None
+    )
+    session = GeminiVoiceSession(settings=settings, system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.call_sid = "CA123"
+    
+    # 1. No se inicia el contador hasta recibir el mark
+    assert session.silence_watch_task is None
+    
+    # 2. El mark correcto inicia el temporizador
+    session.twilio_playback_mark = "bot_turn_end:1"
+    # Run handle_twilio_mark task
+    await session.handle_twilio_mark("bot_turn_end:1")
+    assert session.silence_watch_task is not None
+    assert session.awaiting_user_response is True
+    
+    # 3. Un mark antiguo no inicia el temporizador
+    session.silence_watch_task = None
+    await session.handle_twilio_mark("bot_turn_end:0") # old mark
+    assert session.silence_watch_task is None
+    
+    # 4. El recordatorio se dispara e incrementa el silence_reminder_index
+    session.twilio_playback_mark = "bot_turn_end:2"
+    await session.handle_twilio_mark("bot_turn_end:2")
+    # Wait for the task to complete
+    await asyncio.sleep(0.15)
+    assert session.silence_reminder_sent is True
+    assert session.silence_reminder_active is True
+    assert session.silence_reminder_index == 1 # circular increment from 0 to 1
+    
+    # 5. Solo un recordatorio por espera (max per wait)
+    # Even if we run watch again, it shouldn't trigger since silence_reminder_sent is True
+    session.silence_watch_task = None
+    session.awaiting_user_response = True
+    await session.start_silence_watch()
+    await asyncio.sleep(0.15)
+    # Check index didn't increment again
+    assert session.silence_reminder_index == 1
+
+
+@pytest.mark.asyncio
+async def test_silence_watch_cancellation_on_user_speech():
+    """Verify that user speech cancels silence timer and clears Twilio playback buffers."""
+    settings = Settings(
+        silence_reminder_enabled=True,
+        silence_reminder_seconds=0.2,
+        env_file=None
+    )
+    session = GeminiVoiceSession(settings=settings, system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.call_sid = "CA123"
+    
+    # Pre-seed clear callback mock
+    mock_clear = AsyncMock()
+    session.on_twilio_clear = mock_clear
+    
+    # Start watch
+    session.twilio_playback_mark = "bot_turn_end:1"
+    await session.handle_twilio_mark("bot_turn_end:1")
+    assert session.silence_watch_task is not None
+    
+    # User speaks at 0.05s (before 0.2s timeout)
+    await asyncio.sleep(0.05)
+    session.on_user_speech_start()
+    
+    # Wait to ensure timer would have fired
+    await asyncio.sleep(0.2)
+    # Should not have triggered reminder
+    assert session.silence_reminder_sent is False
+    assert session.user_speaking is True
+    
+    # Verify that if silence reminder was active, user speaking clears twilio buffer
+    session.silence_reminder_active = True
+    session.on_user_speech_start()
+    await asyncio.sleep(0.05)
+    mock_clear.assert_called_once()
+    assert session.silence_reminder_active is False
+
+
+def test_local_vad_rms_noise_filtering():
+    """Verify that a single noisy frame does not activate VAD, but multiple frames do."""
+    settings = Settings(
+        user_speech_rms_threshold=400,
+        user_speech_min_active_ms=50,
+        user_speech_hangover_ms=100,
+        env_file=None
+    )
+    session = GeminiVoiceSession(settings=settings, system_instruction="system")
+    
+    # Create empty, low-rms audio (160 bytes of zero)
+    silence = b"\x00" * 160
+    # High RMS noise frame (rms = 500)
+    import audioop
+    noise_frame = b"\x00\x7f" * 80
+    
+    # 1. Single noisy frame shouldn't trigger VAD since min_active_ms is 50
+    session.process_input_audio_for_vad(noise_frame)
+    assert session.user_speaking is False
+    
+    # 2. Multiple active frames exceeding 50ms should trigger VAD
+    import time
+    # Simulate consecutive active frames spanning 60ms
+    session.process_input_audio_for_vad(noise_frame)
+    session._vad_speech_start_time = time.monotonic() - 0.06 # backdate start to simulate duration
+    session.process_input_audio_for_vad(noise_frame)
+    
+    assert session.user_speaking is True
+
+
+@pytest.mark.asyncio
+async def test_silence_watch_ignored_in_finished_or_reconnecting_states():
+    """Verify that silence reminder is not started during bot playback, finished states, RGPD rejection, or reconnection."""
+    settings = Settings(
+        silence_reminder_enabled=True,
+        silence_reminder_seconds=0.1,
+        env_file=None
+    )
+    session = GeminiVoiceSession(settings=settings, system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.call_sid = "CA123"
+    session.twilio_playback_mark = "bot_turn_end:1"
+    
+    # 1. Ignored if phase is ROLEPLAY_FINISHED
+    session.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+    await session.handle_twilio_mark("bot_turn_end:1")
+    assert session.silence_watch_task is None
+    
+    # 2. Ignored if RGPD rejected
+    session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
+    session.candidate_context["rgpd_ok"] = False
+    await session.handle_twilio_mark("bot_turn_end:1")
+    assert session.silence_watch_task is None
+    
+    # 3. Ignored if reconnecting
+    session.candidate_context["rgpd_ok"] = True
+    session._reconnecting = True
+    await session.handle_twilio_mark("bot_turn_end:1")
+    assert session.silence_watch_task is None
+
+
 
 
 

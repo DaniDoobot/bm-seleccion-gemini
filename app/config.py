@@ -28,6 +28,18 @@ class Settings(BaseSettings):
     vad_silence_duration_ms: int = 130
     vad_prefix_padding_ms: int = 120
 
+    # ── Silence Reminder and Local VAD ────────────────────────────────────────
+    silence_reminder_enabled: bool = True
+    silence_reminder_seconds: float = 5.5
+    silence_reminder_max_per_wait: int = 1
+
+    user_speech_rms_threshold: int = 450
+    user_speech_min_active_ms: int = 120
+    user_speech_hangover_ms: int = 250
+
+    gemini_vad_prefix_padding_ms: int = 20
+    gemini_vad_silence_duration_ms: int = 700
+
     # ── Server ────────────────────────────────────────────────────────────────
     port: int = 8000
     public_url: str = ""
