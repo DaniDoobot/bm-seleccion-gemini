@@ -188,7 +188,7 @@ async def test_send_n8n_event_does_not_retry_4xx(mock_post):
     )
     
     with patch("app.services.n8n_events.get_settings", return_value=settings):
-        res = await send_n8n_event("Transcript", {"data": "test"}, "key")
+        res = await send_n8n_event("post_call_transcription", {"data": "test"}, "key")
         assert res is False
         assert mock_post.call_count == 1  # No retries on 4xx!
 
@@ -210,7 +210,7 @@ async def test_send_n8n_event_retries_on_5xx_and_network_errors(mock_post):
     with patch("app.services.n8n_events.get_settings", return_value=settings):
         # Patch sleep to make test run fast
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            res = await send_n8n_event("Transcript", {"data": "test"}, "key")
+            res = await send_n8n_event("post_call_transcription", {"data": "test"}, "key")
             assert res is False
             assert mock_post.call_count == 3  # 3 attempts!
 
@@ -230,7 +230,7 @@ async def test_send_n8n_event_with_token(mock_post):
     )
     
     with patch("app.services.n8n_events.get_settings", return_value=settings):
-        res = await send_n8n_event("Transcript", {"data": "test"}, "key")
+        res = await send_n8n_event("post_call_transcription", {"data": "test"}, "key")
         assert res is True
         mock_post.assert_called_once()
         headers = mock_post.call_args[1]["headers"]
@@ -254,7 +254,7 @@ async def test_send_n8n_event_without_token(mock_post):
     )
     
     with patch("app.services.n8n_events.get_settings", return_value=settings):
-        res = await send_n8n_event("Transcript", {"data": "test"}, "key")
+        res = await send_n8n_event("post_call_transcription", {"data": "test"}, "key")
         assert res is True
         mock_post.assert_called_once()
         headers = mock_post.call_args[1]["headers"]
@@ -328,7 +328,7 @@ def test_recording_status_callback_204_on_valid_signature(mock_send_event, mock_
     
     assert event_type == "recording.completed"
     assert idempotency_key == "recording.completed:RE222"
-    assert payload["type"] == "Audio"
+    assert payload["type"] == "post_call_audio"
     assert payload["event_type"] == "recording.completed"
     assert "body" not in payload  # Verify no root body wrapper!
     
@@ -376,7 +376,7 @@ def test_recording_status_callback_absent(mock_send_event, mock_validate, monkey
     
     assert event_type == "recording.absent"
     assert idempotency_key == "recording.absent:RE222"
-    assert payload["type"] == "Audio"
+    assert payload["type"] == "post_call_audio"
     assert payload["event_type"] == "recording.absent"
     
     data = payload["data"]
@@ -514,7 +514,7 @@ def test_conversation_id_correlation_in_audio_event(mock_send_event, mock_valida
     args, kwargs = mock_send_event.call_args
     event_type, payload, idempotency_key = args
     
-    assert payload["type"] == "Audio"
+    assert payload["type"] == "post_call_audio"
     assert payload["data"]["conversation_id"] == "CA_CORRELATION_123"
     assert payload["data"]["call_sid"] == "CA_CORRELATION_123"
 
@@ -573,8 +573,9 @@ def test_conversation_id_correlation_in_transcript_event(mock_send_event, mock_s
     args, kwargs = mock_send_event.call_args
     event_type, payload, idempotency_key = args
     
-    assert payload["type"] == "Transcript"
+    assert payload["type"] == "post_call_transcription"
     assert payload["data"]["conversation_id"] == "CA_TRANSCRIPT_123"
     assert payload["data"]["call_sid"] == "CA_TRANSCRIPT_123"
     assert payload["data"]["candidate"]["rgpd_ok"] is True
+
 

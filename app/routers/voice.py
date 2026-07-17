@@ -188,7 +188,7 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
         }
 
         event_payload = {
-            "type": "Transcript",
+            "type": "post_call_transcription",
             "event_type": "session.completed",
             "event_id": f"session.completed:{gemini_session.call_sid}",
             "data": {
@@ -210,7 +210,7 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
         
         async def _dispatch_to_n8n():
             try:
-                await send_n8n_event("Transcript", event_payload, idempotency_key)
+                await send_n8n_event("post_call_transcription", event_payload, idempotency_key)
             except Exception as e:
                 logger.error("Error sending transcript event to n8n: %s", e)
 
@@ -466,7 +466,7 @@ async def recording_status_callback(
                 event_type = "recording.absent"
                 idempotency_key = f"recording.absent:{recording_sid}"
                 payload = {
-                    "type": "Audio",
+                    "type": "post_call_audio",
                     "event_type": event_type,
                     "event_id": f"{event_type}:{recording_sid}",
                     "data": {
@@ -497,7 +497,7 @@ async def recording_status_callback(
                     channels = 2
 
                 payload = {
-                    "type": "Audio",
+                    "type": "post_call_audio",
                     "event_type": event_type,
                     "event_id": f"{event_type}:{recording_sid}",
                     "data": {
