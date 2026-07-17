@@ -215,6 +215,55 @@ async def test_send_n8n_event_retries_on_5xx_and_network_errors(mock_post):
             assert mock_post.call_count == 3  # 3 attempts!
 
 
+@patch("httpx.AsyncClient.post")
+@pytest.mark.asyncio
+async def test_send_n8n_event_with_token(mock_post):
+    """Verify send_n8n_event includes Authorization header when token is set."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_post.return_value = mock_response
+    
+    settings = Settings(
+        n8n_events_webhook_url="https://n8n.com/webhook",
+        n8n_webhook_token="test-secret-token",
+        env_file=None
+    )
+    
+    with patch("app.services.n8n_events.get_settings", return_value=settings):
+        res = await send_n8n_event("Transcript", {"data": "test"}, "key")
+        assert res is True
+        mock_post.assert_called_once()
+        headers = mock_post.call_args[1]["headers"]
+        assert headers["Authorization"] == "Bearer test-secret-token"
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Idempotency-Key"] == "key"
+
+
+@patch("httpx.AsyncClient.post")
+@pytest.mark.asyncio
+async def test_send_n8n_event_without_token(mock_post):
+    """Verify send_n8n_event does not include Authorization header when token is empty."""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_post.return_value = mock_response
+    
+    settings = Settings(
+        n8n_events_webhook_url="https://n8n.com/webhook",
+        n8n_webhook_token="",
+        env_file=None
+    )
+    
+    with patch("app.services.n8n_events.get_settings", return_value=settings):
+        res = await send_n8n_event("Transcript", {"data": "test"}, "key")
+        assert res is True
+        mock_post.assert_called_once()
+        headers = mock_post.call_args[1]["headers"]
+        assert "Authorization" not in headers
+        assert headers["Content-Type"] == "application/json"
+        assert headers["Idempotency-Key"] == "key"
+
+
+
 # 6. Incoming TwiML & Webhook Callback Signature tests
 def test_recording_status_callback_403_on_invalid_signature(monkeypatch):
     """Verify signature validator blocks invalid request with 403."""
