@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # ── Server ────────────────────────────────────────────────────────────────
     port: int = 8000
     public_url: str = ""
+    public_ws_base_url: str = ""
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: str = "*"

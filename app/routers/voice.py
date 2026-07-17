@@ -27,11 +27,11 @@ import json
 import logging
 
 import websockets.exceptions
-from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, Response, HTTPException
 
 from app.config import get_settings
 from app.core.audio import decode_twilio_to_gemini, encode_gemini_to_twilio
-from app.core.gemini_session import GeminiVoiceSession
+from app.core.gemini_session import GeminiVoiceSession, OnboardingPhase
 from app.scenarios.registry import get_scenario
 
 logger = logging.getLogger(__name__)
@@ -39,33 +39,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Voice"])
 
 
-@router.websocket("/voice/stream")
-async def voice_stream(
-    websocket: WebSocket,
-    scenario: str = Query(
-        ...,
-        description="Scenario slug (e.g. seleccion_1, seleccion_2).",
-    ),
-) -> None:
-    """WebSocket endpoint for Twilio ↔ Gemini Live audio streaming.
-
-    The client (Twilio) connects and sends a 'start' event followed by
-    'media' events containing base64-encoded µ-law 8 kHz audio chunks.
-
-    Query parameters:
-        scenario: Slug of the voice scenario to run.
-
-    The WebSocket closes with code 1008 (Policy Violation) if:
-      - The scenario slug is not registered.
-      - GEMINI_API_KEY is not configured.
-    """
+async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
+    """Core logic to run the Twilio ↔ Gemini Live audio streaming bridge."""
     await websocket.accept()
 
     # ── 1. Resolve scenario ───────────────────────────────────────────────────
-    scenario_config = get_scenario(scenario)
+    scenario_config = get_scenario(scenario_id)
     if scenario_config is None:
-        logger.warning("Unknown scenario requested: %s", scenario)
-        await websocket.close(code=1008, reason=f"Unknown scenario: '{scenario}'")
+        logger.warning("Unknown scenario requested: %s", scenario_id)
+        await websocket.close(code=1008, reason=f"Unknown scenario: '{scenario_id}'")
         return
 
     settings = get_settings()
@@ -76,7 +58,7 @@ async def voice_stream(
 
     logger.info(
         "Voice stream connected. scenario=%s model=%s voice=%s",
-        scenario,
+        scenario_id,
         settings.gemini_model,
         settings.gemini_voice_name,
     )
@@ -216,6 +198,15 @@ async def voice_stream(
                             }
                             await websocket.send_text(json.dumps(clear_msg))
 
+                    elif event_type == "turn_complete":
+                        # Check if roleplay is finished. If so, exit loop to close connection cleanly.
+                        if gemini_session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED:
+                            logger.info(
+                                "Roleplay reached finished phase. Closing stream. scenario=%s",
+                                scenario_config.scenario_id,
+                            )
+                            break
+
                     elif event_type == "unknown":
                         logger.debug(
                             "Unhandled Gemini event: %s", event_data.get("raw")
@@ -256,3 +247,65 @@ async def voice_stream(
             scenario_config.scenario_id,
             stream_sid,
         )
+
+
+@router.websocket("/voice/stream")
+async def voice_stream(
+    websocket: WebSocket,
+    scenario: str = Query(
+        ...,
+        description="Scenario slug (e.g. seleccion_1, seleccion_2).",
+    ),
+) -> None:
+    """Legacy WebSocket endpoint using query parameter 'scenario'."""
+    await handle_voice_stream(websocket, scenario)
+
+
+@router.websocket("/voice/stream/{scenario_id}")
+async def voice_stream_path(
+    websocket: WebSocket,
+    scenario_id: str,
+) -> None:
+    """WebSocket endpoint using path parameter 'scenario_id'."""
+    await handle_voice_stream(websocket, scenario_id)
+
+
+@router.api_route(
+    "/voice/incoming/{scenario_id}",
+    methods=["GET", "POST"],
+    summary="Twilio incoming call webhook",
+)
+async def voice_incoming(scenario_id: str) -> Response:
+    """TwiML response to connect Twilio call to the scenario's WebSocket stream.
+
+    Supports both GET and POST requests.
+    Returns 404 if the scenario does not exist.
+    Returns 500 if PUBLIC_WS_BASE_URL is not configured.
+    """
+    scenario_config = get_scenario(scenario_id)
+    if scenario_config is None:
+        logger.warning("Incoming call request for unknown scenario: %s", scenario_id)
+        raise HTTPException(status_code=404, detail="Scenario not found")
+
+    settings = get_settings()
+    if not settings.public_ws_base_url:
+        logger.error("PUBLIC_WS_BASE_URL is not configured. Cannot generate TwiML XML.")
+        raise HTTPException(
+            status_code=500,
+            detail="PUBLIC_WS_BASE_URL is not configured.",
+        )
+
+    # Construct public WebSocket URL for the scenario
+    ws_base = settings.public_ws_base_url.rstrip("/")
+    ws_url = f"{ws_base}/{scenario_id}"
+
+    # Build TwiML XML response
+    twiml_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url="{ws_url}" />
+    </Connect>
+    <Hangup />
+</Response>"""
+
+    return Response(content=twiml_xml, media_type="application/xml")

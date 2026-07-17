@@ -134,6 +134,7 @@ Variables configurables (con valores por defecto validados):
 | `PORT` | `8000` | Puerto del servidor |
 | `CORS_ORIGINS` | `*` | Orígenes CORS permitidos |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |
+| `PUBLIC_WS_BASE_URL` | | URL base pública de WebSocket para la integración con Twilio |
 
 ---
 
