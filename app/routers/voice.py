@@ -319,6 +319,14 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             )
 
                     elif event_type == "audio":
+                        # Set normal turn context under lock if not already a silence reminder
+                        if not gemini_session.model_speaking:
+                            async with gemini_session.silence_state_lock:
+                                if gemini_session.current_model_turn_kind != "silence_reminder":
+                                    gemini_session.current_model_turn_kind = "normal_turn"
+                                    gemini_session.current_model_turn_request_id = None
+                                    gemini_session.current_model_turn_interrupted = False
+
                         # Set model speaking state
                         gemini_session.model_speaking = True
                         gemini_session.awaiting_user_response = False
@@ -350,6 +358,7 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                         # Reset model speaking and silence reminder active status
                         gemini_session.model_speaking = False
                         gemini_session.silence_reminder_active = False
+                        gemini_session.current_model_turn_interrupted = True
                         # Barge-in: clear Twilio's audio playback buffer
                         if stream_sid:
                             logger.info(
@@ -372,26 +381,10 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             await asyncio.sleep(1.5)
                             break
 
-                        # Send turn completion mark to Twilio to track bot playback completion
-                        gemini_session.bot_turn_counter += 1
-                        turn_id = gemini_session.bot_turn_counter
-                        mark_name = f"bot_turn_end:{turn_id}"
-                        gemini_session.twilio_playback_mark = mark_name
-
-                        if stream_sid:
-                            mark_msg = {
-                                "event": "mark",
-                                "streamSid": stream_sid,
-                                "mark": {
-                                    "name": mark_name
-                                }
-                            }
-                            await websocket.send_text(json.dumps(mark_msg))
-                            logger.info(
-                                "Sent bot turn end mark to Twilio. call_sid=%s mark=%s",
-                                gemini_session._mask_sid(gemini_session.call_sid),
-                                mark_name
-                            )
+                        # Consume turn complete and get mark payload
+                        mark_payload = await gemini_session.consume_turn_complete()
+                        if mark_payload:
+                            await websocket.send_text(json.dumps(mark_payload))
 
                     elif event_type == "unknown":
                         logger.debug(

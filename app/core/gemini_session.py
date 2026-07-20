@@ -119,6 +119,16 @@ class GeminiVoiceSession:
         self.twilio_playback_mark: Optional[str] = None
         self.bot_turn_counter: int = 0
 
+        # Wait cycle, atomic lock, pending marks registry, and explicit model turn context
+        self.wait_cycle_id: int = 0
+        self.silence_reminder_count: int = 0
+        self.silence_reminder_request_id: Optional[str] = None
+        self.silence_state_lock = asyncio.Lock()
+        self.pending_marks: Dict[str, Dict[str, Any]] = {}
+        self.current_model_turn_kind: Optional[str] = None
+        self.current_model_turn_request_id: Optional[str] = None
+        self.current_model_turn_interrupted: bool = False
+
         # Local VAD accumulator variables
         self._vad_consecutive_active_frames = 0
         self._vad_speech_start_time = None
@@ -386,6 +396,11 @@ class GeminiVoiceSession:
 
     async def close(self) -> None:
         """Close the Gemini WebSocket connection gracefully."""
+        # Cancel silence watch task to prevent leaks
+        if hasattr(self, "silence_watch_task") and self.silence_watch_task and not self.silence_watch_task.done():
+            self.silence_watch_task.cancel()
+            self.silence_watch_task = None
+
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -921,12 +936,15 @@ class GeminiVoiceSession:
         if self.silence_watch_task and not self.silence_watch_task.done():
             self.silence_watch_task.cancel()
             logger.info("Silence watch cancelled by user speech. call_sid=%s", self._mask_sid(self.call_sid))
+        self.silence_watch_task = None
 
         self.silence_reminder_sent = False
 
         # Interrupt silence reminder playback if it was active
         if self.silence_reminder_active:
             self.silence_reminder_active = False
+            self.current_model_turn_interrupted = True
+            
             if hasattr(self, "on_twilio_clear") and self.on_twilio_clear:
                 try:
                     import asyncio
@@ -934,6 +952,12 @@ class GeminiVoiceSession:
                     loop.create_task(self.on_twilio_clear())
                 except Exception as e:
                     logger.error("Error calling on_twilio_clear: %s", e)
+
+            # Remove any pending silence reminder marks from registry
+            for key in list(self.pending_marks.keys()):
+                if self.pending_marks[key].get("type") == "silence_reminder":
+                    self.pending_marks.pop(key, None)
+                    logger.info("Pending silence reminder mark invalidated: %s", key)
 
     def on_user_speech_end(self) -> None:
         """Callback triggered when local VAD confirms user has finished speaking."""
@@ -950,9 +974,15 @@ class GeminiVoiceSession:
     async def handle_twilio_mark(self, mark_name: str) -> None:
         """Handle Twilio mark event indicating bot playback completed."""
         import time
-        if self.twilio_playback_mark == mark_name:
-            logger.info("Bot playback completed. call_sid=%s mark=%s", self._mask_sid(self.call_sid), mark_name)
-            
+        async with self.silence_state_lock:
+            # Check if mark is pending in registry
+            if mark_name not in self.pending_marks:
+                logger.info("Stale playback mark ignored. mark=%s", mark_name)
+                return
+
+            mark_info = self.pending_marks.pop(mark_name)
+            mark_type = mark_info.get("type")
+
             # Prevent starting reminder in finished/closed/reconnecting scenarios
             if (self.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED or 
                 self.candidate_context.get("rgpd_ok") is False or 
@@ -962,17 +992,43 @@ class GeminiVoiceSession:
                 self.model_speaking = False
                 return
 
-            if not self.user_speaking:
+            if mark_type == "normal_turn":
+                logger.info("Normal bot mark received. cycle=%d", self.wait_cycle_id)
                 self.model_speaking = False
-                self.awaiting_user_response = True
-                self.bot_playback_completed_at = time.monotonic()
-                self.silence_reminder_sent = False
-                self.silence_reminder_active = False
-                self.user_speech_ended_at = None
 
-                await self.start_silence_watch()
-            else:
-                logger.info("Mark received but user is already speaking. Skipping silence watch.")
+                if not self.user_speaking:
+                    # Increment wait cycle ID and reset count
+                    self.wait_cycle_id += 1
+                    self.silence_reminder_count = 0
+                    self.silence_reminder_active = False
+                    self.awaiting_user_response = True
+                    self.bot_playback_completed_at = time.monotonic()
+                    self.silence_reminder_sent = False
+                    self.user_speech_ended_at = None
+
+                    # Launch a new silence watch timer
+                    await self.start_silence_watch()
+                else:
+                    logger.info("Mark received but user is already speaking. Skipping new cycle start.")
+
+            elif mark_type == "silence_reminder":
+                mark_cycle = mark_info.get("wait_cycle_id")
+                reminder_id = mark_info.get("reminder_id")
+
+                if mark_cycle != self.wait_cycle_id:
+                    logger.info(
+                        "Stale playback mark ignored (wrong cycle). mark=%s mark_cycle=%s current_cycle=%s",
+                        mark_name,
+                        mark_cycle,
+                        self.wait_cycle_id
+                    )
+                    return
+
+                logger.info("Silence reminder playback completed. cycle=%d reminder_id=%d", self.wait_cycle_id, reminder_id)
+                self.silence_reminder_active = False
+                self.awaiting_user_response = True
+                # Do NOT reset silence_reminder_sent to False
+                # Do NOT start a new temporizador/silence watch
 
     async def start_silence_watch(self) -> None:
         """Start the silence watch timer in a background task."""
@@ -981,9 +1037,11 @@ class GeminiVoiceSession:
 
         self.silence_watch_generation += 1
         current_gen = self.silence_watch_generation
+        current_cycle = self.wait_cycle_id
 
         logger.info(
-            "Silence watch started. call_sid=%s timeout=%s",
+            "Silence watch started. cycle=%d call_sid=%s timeout=%s",
+            current_cycle,
             self._mask_sid(self.call_sid),
             self._settings.silence_reminder_seconds
         )
@@ -995,25 +1053,29 @@ class GeminiVoiceSession:
                 now = time.monotonic()
                 elapsed = now - (self.bot_playback_completed_at or 0)
 
-                if (current_gen == self.silence_watch_generation and
-                    self.awaiting_user_response and
-                    not self.user_speaking and
-                    not self.model_speaking and
-                    not self.silence_reminder_sent and
-                    not self.silence_reminder_active and
-                    self.onboarding_phase != OnboardingPhase.ROLEPLAY_FINISHED and
-                    self.candidate_context.get("rgpd_ok") is not False and
-                    not getattr(self, "_reconnecting", False) and
-                    self.stream_sid and
-                    self._ready and
-                    (5.0 <= elapsed <= 6.5 if self._settings.silence_reminder_seconds == 5.5 else (self._settings.silence_reminder_seconds - 0.5) <= elapsed <= (self._settings.silence_reminder_seconds + 1.0))):
+                async with self.silence_state_lock:
+                    if (current_gen == self.silence_watch_generation and
+                        current_cycle == self.wait_cycle_id and
+                        self.awaiting_user_response and
+                        not self.user_speaking and
+                        not self.model_speaking and
+                        not self.silence_reminder_sent and
+                        not self.silence_reminder_active and
+                        self.silence_reminder_count < self._settings.silence_reminder_max_per_wait and
+                        self.onboarding_phase != OnboardingPhase.ROLEPLAY_FINISHED and
+                        self.candidate_context.get("rgpd_ok") is not False and
+                        not getattr(self, "_reconnecting", False) and
+                        self.stream_sid and
+                        self._ready and
+                        (5.0 <= elapsed <= 6.5 if self._settings.silence_reminder_seconds == 5.5 else (self._settings.silence_reminder_seconds - 0.5) <= elapsed <= (self._settings.silence_reminder_seconds + 1.0))):
 
-                    logger.info(
-                        "Silence reminder triggered. call_sid=%s elapsed_ms=%d",
-                        self._mask_sid(self.call_sid),
-                        int(elapsed * 1000)
-                    )
-                    await self.trigger_silence_reminder()
+                        logger.info(
+                            "Silence reminder triggered. cycle=%d elapsed_ms=%d",
+                            self.wait_cycle_id,
+                            int(elapsed * 1000)
+                        )
+                        # We trigger the reminder under lock
+                        await self._locked_trigger_silence_reminder()
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -1021,35 +1083,110 @@ class GeminiVoiceSession:
 
         self.silence_watch_task = asyncio.create_task(_watch())
 
-    async def trigger_silence_reminder(self) -> None:
-        """Alternates deterministically between three silence reminders using circular indexing."""
+    async def _locked_trigger_silence_reminder(self) -> None:
+        """Atomic internal method to reserve state and trigger reminder outside lock."""
         phrases = [
             "Oye, ¿sigues ahí?",
             "¿Puedes oírme? No te escucho.",
             "¿Todavía sigues ahí?"
         ]
-        phrase = phrases[self.silence_reminder_index]
-        self.silence_reminder_index = (self.silence_reminder_index + 1) % len(phrases)
+        
+        self.silence_reminder_count += 1
+        req_id = f"silence-reminder:{self.wait_cycle_id}:{self.silence_reminder_count}"
 
-        self.silence_reminder_sent = True
+        if self.silence_reminder_request_id == req_id:
+            logger.warning("Duplicate silence reminder suppressed. cycle=%d req_id=%s", self.wait_cycle_id, req_id)
+            return
+
+        self.silence_reminder_request_id = req_id
         self.silence_reminder_active = True
         self.model_speaking = True
         self.awaiting_user_response = False
+        self.silence_reminder_sent = True
 
+        # Explicit model turn context configuration
+        self.current_model_turn_kind = "silence_reminder"
+        self.current_model_turn_request_id = req_id
+        self.current_model_turn_interrupted = False
+
+        phrase = phrases[self.silence_reminder_index]
+        self.silence_reminder_index = (self.silence_reminder_index + 1) % len(phrases)
+
+        # Dispatch instruction to Gemini Live
         instruction = (
             "CONTROL INTERNO DE LLAMADA:\n"
-            "El interlocutor lleva 5,5 segundos sin responder.\n"
-            f"Pronuncia únicamente esta frase:\n"
+            "Pronuncia exactamente una vez la siguiente frase:\n"
             f"\"{phrase}\"\n"
-            "No avances ninguna fase.\n"
-            "No respondas en nombre del candidato.\n"
-            "No repitas el onboarding.\n"
+            "No la repitas.\n"
+            "No añadas ninguna palabra antes ni después.\n"
             "No repitas la pregunta anterior.\n"
-            "Después de pronunciarla, vuelve a esperar al interlocutor."
+            "No avances ninguna fase.\n"
+            "Después quédate esperando al interlocutor."
         )
 
-        try:
-            logger.info("Sending silence reminder instruction: '%s'", phrase)
-            await self.send_text_turn(instruction)
-        except Exception as e:
-            logger.error("Error sending silence reminder: %s", e)
+        async def _dispatch():
+            try:
+                logger.info("Sending silence reminder instruction: '%s'", phrase)
+                await self.send_text_turn(instruction)
+            except Exception as e:
+                logger.error("Error sending silence reminder: %s", e)
+
+        asyncio.create_task(_dispatch())
+
+    async def consume_turn_complete(self) -> Optional[dict]:
+        """Consumes the current model turn completion and returns a mark message payload if appropriate."""
+        import time
+        async with self.silence_state_lock:
+            if self.current_model_turn_kind is None:
+                return None
+
+            if self.current_model_turn_interrupted:
+                logger.info(
+                    "Interrupted reminder turn_complete ignored. cycle=%d request_id=%s",
+                    self.wait_cycle_id,
+                    self.current_model_turn_request_id
+                )
+                self.current_model_turn_kind = None
+                self.current_model_turn_request_id = None
+                self.current_model_turn_interrupted = False
+                return None
+
+            kind = self.current_model_turn_kind or "normal_turn"
+            mark_name = None
+            mark_metadata = None
+
+            if kind == "silence_reminder":
+                mark_name = f"silence_reminder_end:{self.wait_cycle_id}:{self.silence_reminder_count}"
+                mark_metadata = {
+                    "type": "silence_reminder",
+                    "wait_cycle_id": self.wait_cycle_id,
+                    "reminder_id": self.silence_reminder_count,
+                    "created_at": time.time()
+                }
+            else:
+                self.bot_turn_counter += 1
+                mark_name = f"bot_turn_end:{self.bot_turn_counter}"
+                mark_metadata = {
+                    "type": "normal_turn",
+                    "turn_id": self.bot_turn_counter,
+                    "created_at": time.time()
+                }
+
+            # Register the pending mark
+            self.pending_marks[mark_name] = mark_metadata
+
+            # Reset explicit turn context
+            self.current_model_turn_kind = None
+            self.current_model_turn_request_id = None
+            self.current_model_turn_interrupted = False
+
+            # Return payload to send to Twilio
+            if self.stream_sid:
+                return {
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {
+                        "name": mark_name
+                    }
+                }
+            return None

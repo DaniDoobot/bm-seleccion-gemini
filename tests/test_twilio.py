@@ -985,16 +985,16 @@ def test_twiml_recording_configuration_and_order():
         assert 'recordingStatusCallback="https://test.doobot.ai/voice/recording-status/seleccion_2"' in xml_content_2
 
 
-def test_first_locution_contains_recording_warning():
-    """Verify that initial_message of both scenarios starts with the recording warning."""
+def test_first_locution_does_not_contain_recording_warning():
+    """Verify that initial_message of both scenarios does not start with the recording warning."""
     from app.scenarios.registry import get_scenario
     
     sc_1 = get_scenario("seleccion_1")
     sc_2 = get_scenario("seleccion_2")
     
     warning = "Esta llamada está siendo grabada con fines de formación y evaluación."
-    assert sc_1.initial_message.startswith(warning)
-    assert sc_2.initial_message.startswith(warning)
+    assert not sc_1.initial_message.startswith(warning)
+    assert not sc_2.initial_message.startswith(warning)
 
 
 @patch("app.routers.voice.GeminiVoiceSession")
@@ -1258,7 +1258,7 @@ def test_gemini_setup_contains_vad_configuration():
 
 @pytest.mark.asyncio
 async def test_silence_watch_timers_and_triggers():
-    """Test timer trigger timing, start constraints, and cancellation scenarios."""
+    """Test wait cycles, lock-protected triggers, and Twilio playback marks."""
     settings = Settings(
         silence_reminder_enabled=True,
         silence_reminder_seconds=0.1,  # Short timeout for testing
@@ -1272,43 +1272,61 @@ async def test_silence_watch_timers_and_triggers():
     # 1. No se inicia el contador hasta recibir el mark
     assert session.silence_watch_task is None
     
-    # 2. El mark correcto inicia el temporizador
-    session.twilio_playback_mark = "bot_turn_end:1"
-    # Run handle_twilio_mark task
+    # 2. El mark correcto de turno normal inicia el temporizador
+    session.pending_marks["bot_turn_end:1"] = {
+        "type": "normal_turn",
+        "turn_id": 1
+    }
     await session.handle_twilio_mark("bot_turn_end:1")
     assert session.silence_watch_task is not None
     assert session.awaiting_user_response is True
+    assert session.wait_cycle_id == 1
+    assert session.silence_reminder_count == 0
     
-    # 3. Un mark antiguo no inicia el temporizador
+    # 3. Un mark antiguo/no registrado no inicia el temporizador
     session.silence_watch_task = None
-    await session.handle_twilio_mark("bot_turn_end:0") # old mark
+    await session.handle_twilio_mark("bot_turn_end:0") # old/unregistered mark
     assert session.silence_watch_task is None
     
-    # 4. El recordatorio se dispara e incrementa el silence_reminder_index
-    session.twilio_playback_mark = "bot_turn_end:2"
+    # 4. El recordatorio se dispara, incrementa el count y establece el turn context
+    session.pending_marks["bot_turn_end:2"] = {
+        "type": "normal_turn",
+        "turn_id": 2
+    }
     await session.handle_twilio_mark("bot_turn_end:2")
-    # Wait for the task to complete
+    assert session.wait_cycle_id == 2
+    assert session.silence_reminder_count == 0
+    
+    # Wait for silence watch task to fire trigger
     await asyncio.sleep(0.15)
     assert session.silence_reminder_sent is True
     assert session.silence_reminder_active is True
+    assert session.silence_reminder_count == 1
     assert session.silence_reminder_index == 1 # circular increment from 0 to 1
+    assert session.current_model_turn_kind == "silence_reminder"
+    assert session.current_model_turn_request_id == "silence-reminder:2:1"
     
-    # 5. Solo un recordatorio por espera (max per wait)
-    # Even if we run watch again, it shouldn't trigger since silence_reminder_sent is True
+    # 5. El mark de recordatorio no reinicia el contador ni inicia otro temporizador
+    mark_payload = await session.consume_turn_complete()
+    assert mark_payload is not None
+    assert mark_payload["mark"]["name"] == "silence_reminder_end:2:1"
+    assert "silence_reminder_end:2:1" in session.pending_marks
+    
+    # Twilio returns the silence reminder mark
     session.silence_watch_task = None
-    session.awaiting_user_response = True
-    await session.start_silence_watch()
-    await asyncio.sleep(0.15)
-    # Check index didn't increment again
-    assert session.silence_reminder_index == 1
+    await session.handle_twilio_mark("silence_reminder_end:2:1")
+    assert session.silence_reminder_active is False
+    assert session.awaiting_user_response is True
+    assert session.silence_reminder_count == 1 # remains 1
+    assert session.silence_watch_task is None # no new timer started!
 
 
 @pytest.mark.asyncio
-async def test_silence_watch_cancellation_on_user_speech():
-    """Verify that user speech cancels silence timer and clears Twilio playback buffers."""
+async def test_user_interrupts_reminder_before_turn_complete():
+    """Verify that user speech interrupts active silence reminder, cancels mark, and ignores subsequent turn_complete."""
     settings = Settings(
         silence_reminder_enabled=True,
-        silence_reminder_seconds=0.2,
+        silence_reminder_seconds=0.1,
         env_file=None
     )
     session = GeminiVoiceSession(settings=settings, system_instruction="system")
@@ -1316,31 +1334,93 @@ async def test_silence_watch_cancellation_on_user_speech():
     session._ready = True
     session.call_sid = "CA123"
     
-    # Pre-seed clear callback mock
     mock_clear = AsyncMock()
     session.on_twilio_clear = mock_clear
     
-    # Start watch
-    session.twilio_playback_mark = "bot_turn_end:1"
+    # Start cycle 1
+    session.pending_marks["bot_turn_end:1"] = {
+        "type": "normal_turn",
+        "turn_id": 1
+    }
     await session.handle_twilio_mark("bot_turn_end:1")
-    assert session.silence_watch_task is not None
     
-    # User speaks at 0.05s (before 0.2s timeout)
-    await asyncio.sleep(0.05)
+    # Wait for reminder to trigger
+    await asyncio.sleep(0.15)
+    assert session.silence_reminder_active is True
+    assert session.silence_reminder_count == 1
+    
+    # Register pending mark for silence reminder end
+    session.pending_marks["silence_reminder_end:1:1"] = {
+        "type": "silence_reminder",
+        "wait_cycle_id": 1,
+        "reminder_id": 1
+    }
+    
+    # User starts speaking before turn_complete or playback completes
     session.on_user_speech_start()
+    await asyncio.sleep(0.02)
     
-    # Wait to ensure timer would have fired
-    await asyncio.sleep(0.2)
-    # Should not have triggered reminder
-    assert session.silence_reminder_sent is False
-    assert session.user_speaking is True
-    
-    # Verify that if silence reminder was active, user speaking clears twilio buffer
-    session.silence_reminder_active = True
-    session.on_user_speech_start()
-    await asyncio.sleep(0.05)
+    # 1. Sends clear exactly once
     mock_clear.assert_called_once()
+    
+    # 2. Cancels silence_reminder_active and sets current_model_turn_interrupted
     assert session.silence_reminder_active is False
+    assert session.current_model_turn_interrupted is True
+    
+    # 3. Invalidates the pending silence reminder mark
+    assert "silence_reminder_end:1:1" not in session.pending_marks
+    
+    # 4. Subsequent turn_complete is consumed and returns None (no mark generated)
+    mark_payload = await session.consume_turn_complete()
+    assert mark_payload is None
+    
+    # 5. Turn complete did not create a new cycle, restart count, or allow duplicate reminder
+    assert session.wait_cycle_id == 1
+    assert session.silence_reminder_count == 1
+    
+    # 6. Ignored mark from Twilio is safe
+    await session.handle_twilio_mark("silence_reminder_end:1:1")
+    assert session.silence_watch_task is None
+
+
+@pytest.mark.asyncio
+async def test_duplicate_turn_complete_does_not_create_two_marks():
+    """Verify that multiple turn_complete calls do not generate multiple marks."""
+    session = GeminiVoiceSession(settings=Settings(env_file=None), system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.current_model_turn_kind = "normal_turn"
+    
+    payload1 = await session.consume_turn_complete()
+    assert payload1 is not None
+    
+    payload2 = await session.consume_turn_complete()
+    assert payload2 is None  # Already reset, so second call does nothing
+
+
+@pytest.mark.asyncio
+async def test_normal_response_creates_new_cycle_and_allows_reminder():
+    """Verify that a normal response following user speech starts a new wait cycle and allows reminder."""
+    session = GeminiVoiceSession(settings=Settings(silence_reminder_seconds=0.1, env_file=None), system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.call_sid = "CA123"
+    session.wait_cycle_id = 1
+    session.silence_reminder_count = 1
+    
+    # Gemini starts normal turn audio
+    session.model_speaking = True
+    session.current_model_turn_kind = "normal_turn"
+    
+    payload = await session.consume_turn_complete()
+    assert payload is not None
+    assert payload["mark"]["name"] == "bot_turn_end:1"
+    
+    # Playback completed starts new cycle
+    await session.handle_twilio_mark("bot_turn_end:1")
+    assert session.wait_cycle_id == 2
+    assert session.silence_reminder_count == 0  # reset!
+    assert session.silence_watch_task is not None
 
 
 def test_local_vad_rms_noise_filtering():
@@ -1353,10 +1433,7 @@ def test_local_vad_rms_noise_filtering():
     )
     session = GeminiVoiceSession(settings=settings, system_instruction="system")
     
-    # Create empty, low-rms audio (160 bytes of zero)
     silence = b"\x00" * 160
-    # High RMS noise frame (rms = 500)
-    import audioop
     noise_frame = b"\x00\x7f" * 80
     
     # 1. Single noisy frame shouldn't trigger VAD since min_active_ms is 50
@@ -1365,9 +1442,8 @@ def test_local_vad_rms_noise_filtering():
     
     # 2. Multiple active frames exceeding 50ms should trigger VAD
     import time
-    # Simulate consecutive active frames spanning 60ms
     session.process_input_audio_for_vad(noise_frame)
-    session._vad_speech_start_time = time.monotonic() - 0.06 # backdate start to simulate duration
+    session._vad_speech_start_time = time.monotonic() - 0.06
     session.process_input_audio_for_vad(noise_frame)
     
     assert session.user_speaking is True
@@ -1385,12 +1461,23 @@ async def test_silence_watch_ignored_in_finished_or_reconnecting_states():
     session.stream_sid = "MZ123"
     session._ready = True
     session.call_sid = "CA123"
-    session.twilio_playback_mark = "bot_turn_end:1"
+    
+    session.pending_marks["bot_turn_end:1"] = {
+        "type": "normal_turn",
+        "turn_id": 1
+    }
     
     # 1. Ignored if phase is ROLEPLAY_FINISHED
     session.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
     await session.handle_twilio_mark("bot_turn_end:1")
     assert session.silence_watch_task is None
+    
+    # Reset
+    session.onboarding_phase = OnboardingPhase.WAITING_READY
+    session.pending_marks["bot_turn_end:1"] = {
+        "type": "normal_turn",
+        "turn_id": 1
+    }
     
     # 2. Ignored if RGPD rejected
     session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
@@ -1398,13 +1485,28 @@ async def test_silence_watch_ignored_in_finished_or_reconnecting_states():
     await session.handle_twilio_mark("bot_turn_end:1")
     assert session.silence_watch_task is None
     
-    # 3. Ignored if reconnecting
+    # Reset
+    session.onboarding_phase = OnboardingPhase.WAITING_READY
     session.candidate_context["rgpd_ok"] = True
+    session.pending_marks["bot_turn_end:1"] = {
+        "type": "normal_turn",
+        "turn_id": 1
+    }
+    
+    # 3. Ignored if reconnecting
     session._reconnecting = True
     await session.handle_twilio_mark("bot_turn_end:1")
     assert session.silence_watch_task is None
 
 
-
-
-
+def test_scenario_system_prompts_rgpd_mention_intact():
+    """Verify that the full system instructions for both scenarios contain the RGPD mentions."""
+    from app.scenarios.registry import get_scenario
+    
+    sc_1 = get_scenario("seleccion_1")
+    sc_2 = get_scenario("seleccion_2")
+    
+    assert "RGPD" in sc_1.system_instruction
+    assert "consentimiento" in sc_1.system_instruction
+    assert "RGPD" in sc_2.system_instruction
+    assert "consentimiento" in sc_2.system_instruction

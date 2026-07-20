@@ -134,7 +134,6 @@ class TestScenarioConfigs:
 
     def test_seleccion_1_initial_message(self):
         expected = (
-            "Esta llamada está siendo grabada con fines de formación y evaluación. "
             "Hola soy Miguel, asistente virtual para evaluación de candidatos "
             "de Boston Medical, esta es la primera prueba, ¿Estás preparado para comenzar?"
         )
