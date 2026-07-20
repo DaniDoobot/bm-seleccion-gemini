@@ -49,6 +49,8 @@ class OnboardingPhase(str, Enum):
     EXPLANATION = "explanation"
     READY_TO_START_ROLEPLAY = "ready_to_start_roleplay"
     ROLEPLAY_ACTIVE = "roleplay_active"
+    FINALIZING_DRAINING = "finalizing_draining"
+    FINAL_FAREWELL_ACTIVE = "final_farewell_active"
     FINALIZING = "finalizing"
     ROLEPLAY_FINISHED = "roleplay_finished"
 
@@ -153,11 +155,19 @@ class GeminiVoiceSession:
         self.finalization_requested: bool = False
         self.final_farewell_active: bool = False
         self.final_farewell_completed: bool = False
+        self.final_farewell_attempt: int = 0
+        self.final_farewell_generation: int = 0
         self.final_farewell_request_id: Optional[str] = None
         self.final_farewell_mark: Optional[str] = None
+        self.final_farewell_audio_started: bool = False
+        self.final_farewell_audio_chunks: int = 0
+        self.final_farewell_transcript_buffer: str = ""
+        self.final_farewell_turn_complete_received: bool = False
         self.final_farewell_retry_count: int = 0
+        self.twilio_close_sent: bool = False
         self._logged_farewell_ignore: bool = False
         self.final_farewell_playback_event = asyncio.Event()
+        self.final_farewell_transcript_event = asyncio.Event()
 
 
     # ── Onboarding State Machine Transitions ──────────────────────────────────
@@ -296,7 +306,6 @@ class GeminiVoiceSession:
                         "la llamada inmediatamente.]"
                     )
                     try:
-                        import asyncio
                         async def _send_rejection():
                             await self.send_text_turn(instruction)
                         loop = asyncio.get_running_loop()
@@ -761,11 +770,18 @@ class GeminiVoiceSession:
                 # outputTranscription (real-time speech-to-text transcript of model response)
                 output_trans = content.get("outputTranscription")
                 if output_trans and "text" in output_trans:
-                    self._model_transcript_accumulator += " " + output_trans["text"]
+                    text_chunk = output_trans["text"]
+                    self._model_transcript_accumulator += " " + text_chunk
+                    if self.final_farewell_active or self.onboarding_phase in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE]:
+                        self.final_farewell_transcript_buffer += " " + text_chunk
+                        norm_buf = self._normalize_text(self.final_farewell_transcript_buffer)
+                        norm_phrase = self._normalize_text(FINAL_FAREWELL_TEXT)
+                        if norm_phrase in norm_buf:
+                            self.final_farewell_transcript_event.set()
                     self.process_model_transcript(self._model_transcript_accumulator.strip())
                     yield {
                         "type": "text",
-                        "data": output_trans["text"],
+                        "data": text_chunk,
                     }
 
                 # Model signals that its turn is complete
@@ -801,7 +817,6 @@ class GeminiVoiceSession:
                             "gracias por participar en el proceso" in norm_accumulated
                         )
                         if (has_terminado and has_gracias) or ("la prueba ha terminado gracias por participar" in norm_accumulated) or ("la simulacion ha terminado gracias por participar" in norm_accumulated) or ("gracias por participar" in norm_accumulated and "terminado" in norm_accumulated):
-                            import asyncio
                             asyncio.create_task(self.request_finalization())
                     
                     self._model_transcript_accumulator = ""
@@ -924,14 +939,14 @@ class GeminiVoiceSession:
         if getattr(self, "_reconnecting", False):
             return
 
-        if getattr(self, "final_farewell_active", False):
+        if self.finalization_requested or self.onboarding_phase in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE, OnboardingPhase.FINALIZING]:
             import audioop
             try:
                 rms = audioop.rms(pcm_8k, 2)
                 threshold = self._settings.user_speech_rms_threshold
                 if rms > threshold:
                     if not getattr(self, "_logged_farewell_ignore", False):
-                        logger.info("User speech ignored during mandatory farewell. call_sid=%s", self._mask_sid(self.call_sid))
+                        logger.info("User speech ignored during finalization. call_sid=%s", self._mask_sid(self.call_sid))
                         self._logged_farewell_ignore = True
                 else:
                     self._logged_farewell_ignore = False
@@ -981,6 +996,9 @@ class GeminiVoiceSession:
 
     def on_user_speech_start(self) -> None:
         """Callback triggered when local VAD confirms user has started speaking."""
+        if self.finalization_requested or self.onboarding_phase in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE, OnboardingPhase.FINALIZING]:
+            return
+
         import time
         logger.info("User speech started. call_sid=%s", self._mask_sid(self.call_sid))
         self.user_speaking = True
@@ -1005,7 +1023,6 @@ class GeminiVoiceSession:
             
             if hasattr(self, "on_twilio_clear") and self.on_twilio_clear:
                 try:
-                    import asyncio
                     loop = asyncio.get_running_loop()
                     loop.create_task(self.on_twilio_clear())
                 except Exception as e:
@@ -1019,6 +1036,9 @@ class GeminiVoiceSession:
 
     def on_user_speech_end(self) -> None:
         """Callback triggered when local VAD confirms user has finished speaking."""
+        if self.finalization_requested or self.onboarding_phase in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE, OnboardingPhase.FINALIZING]:
+            return
+
         import time
         logger.info("User speech ended. call_sid=%s", self._mask_sid(self.call_sid))
         self.user_speaking = False
@@ -1029,16 +1049,10 @@ class GeminiVoiceSession:
         self.first_model_audio_at = None
         self.response_latency_ms = None
 
-        if (self.onboarding_phase == OnboardingPhase.FINALIZING and
-            not self.final_farewell_active and
-            not self.final_farewell_completed):
-            logger.info("Waiting for user speech to end before final farewell. User speech ended. Triggering final farewell.")
-            import asyncio
-            asyncio.create_task(self.trigger_final_farewell())
-
     async def handle_twilio_mark(self, mark_name: str) -> None:
         """Handle Twilio mark event indicating bot playback completed."""
         import time
+        should_trigger_farewell = False
         async with self.silence_state_lock:
             # Check if mark is pending in registry
             if mark_name not in self.pending_marks:
@@ -1057,7 +1071,15 @@ class GeminiVoiceSession:
                 self.model_speaking = False
                 return
 
-            if mark_type == "normal_turn":
+            if mark_type == "pre_farewell_drain":
+                logger.info("Pre-farewell playback drain completed.")
+                if self.finalization_requested:
+                    self.onboarding_phase = OnboardingPhase.FINAL_FAREWELL_ACTIVE
+                    self.final_farewell_generation += 1
+                    self.final_farewell_attempt = 0
+                    should_trigger_farewell = True
+
+            elif mark_type == "normal_turn":
                 logger.info("Normal bot mark received. cycle=%d", self.wait_cycle_id)
                 self.model_speaking = False
 
@@ -1099,19 +1121,21 @@ class GeminiVoiceSession:
                 req_id = mark_info.get("request_id")
                 if req_id != self.final_farewell_request_id:
                     logger.info(
-                        "Stale playback mark ignored (wrong request id). mark=%s req_id=%s current=%s",
-                        mark_name,
-                        req_id,
-                        self.final_farewell_request_id
+                        "Stale final farewell event ignored. expected=%s received=%s",
+                        self.final_farewell_request_id,
+                        req_id
                     )
                     return
 
-                logger.info("Final farewell playback completed. request_id=%s", req_id)
+                logger.info("Final farewell playback completed.")
                 self.final_farewell_active = False
                 self.final_farewell_completed = True
                 self.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
                 self.completion_reason = "roleplay_finished"
                 self.final_farewell_playback_event.set()
+
+        if should_trigger_farewell:
+            await self.trigger_final_farewell()
 
     async def start_silence_watch(self) -> None:
         """Start the silence watch timer in a background task."""
@@ -1216,11 +1240,11 @@ class GeminiVoiceSession:
 
         asyncio.create_task(_dispatch())
 
-    async def consume_turn_complete(self) -> Optional[dict]:
+    async def consume_turn_complete(self, send_to_twilio_cb: Optional[Any] = None) -> Optional[dict]:
         """Consumes the current model turn completion and returns a mark message payload if appropriate."""
         import time
         async with self.silence_state_lock:
-            if self.current_model_turn_kind is None:
+            if self.current_model_turn_kind is None and self.onboarding_phase not in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE]:
                 return None
 
             if self.current_model_turn_interrupted:
@@ -1235,10 +1259,41 @@ class GeminiVoiceSession:
                 return None
 
             kind = self.current_model_turn_kind or "normal_turn"
+
+            if kind == "final_farewell" or self.onboarding_phase == OnboardingPhase.FINAL_FAREWELL_ACTIVE:
+                if not self.final_farewell_audio_started or self.final_farewell_audio_chunks == 0:
+                    logger.info("Stale turn_complete received before final farewell audio. Ignoring.")
+                    self.current_model_turn_kind = None
+                    self.current_model_turn_request_id = None
+                    return None
+
+                self.final_farewell_turn_complete_received = True
+                req_id = self.final_farewell_request_id
+                gen = self.final_farewell_generation
+                attempt = self.final_farewell_attempt
+
+                # Reset explicit turn context
+                self.current_model_turn_kind = None
+                self.current_model_turn_request_id = None
+                self.current_model_turn_interrupted = False
+
+                # Launch async task for transcript grace period and mark emission
+                asyncio.create_task(self._validate_and_emit_farewell_mark(send_to_twilio_cb, req_id, gen, attempt))
+                return None
+
             mark_name = None
             mark_metadata = None
 
-            if kind == "silence_reminder":
+            if self.onboarding_phase == OnboardingPhase.FINALIZING_DRAINING:
+                self.bot_turn_counter += 1
+                mark_name = f"pre_farewell_drain:{self.bot_turn_counter}"
+                mark_metadata = {
+                    "type": "pre_farewell_drain",
+                    "turn_id": self.bot_turn_counter,
+                    "created_at": time.time()
+                }
+                logger.info("Pre-farewell drain mark sent. mark=%s", mark_name)
+            elif kind == "silence_reminder":
                 mark_name = f"silence_reminder_end:{self.wait_cycle_id}:{self.silence_reminder_count}"
                 mark_metadata = {
                     "type": "silence_reminder",
@@ -1246,14 +1301,6 @@ class GeminiVoiceSession:
                     "reminder_id": self.silence_reminder_count,
                     "created_at": time.time()
                 }
-            elif kind == "final_farewell":
-                mark_name = f"final_farewell_end:{self.final_farewell_request_id}"
-                mark_metadata = {
-                    "type": "final_farewell",
-                    "request_id": self.final_farewell_request_id,
-                    "created_at": time.time()
-                }
-                logger.info("Final farewell Gemini turn completed. mark=%s", mark_name)
             else:
                 self.bot_turn_counter += 1
                 mark_name = f"bot_turn_end:{self.bot_turn_counter}"
@@ -1282,16 +1329,85 @@ class GeminiVoiceSession:
                 }
             return None
 
+    async def _validate_and_emit_farewell_mark(
+        self,
+        send_to_twilio_cb: Optional[Any],
+        req_id: Optional[str],
+        gen: int,
+        attempt: int
+    ) -> None:
+        grace_ms = getattr(self._settings, "final_farewell_transcript_grace_ms", 750)
+        grace_s = grace_ms / 1000.0
+
+        try:
+            await asyncio.wait_for(self.final_farewell_transcript_event.wait(), timeout=grace_s)
+        except asyncio.TimeoutError:
+            pass
+
+        import time
+        send_payload = None
+        should_retry = False
+        clear_payload = None
+
+        async with self.silence_state_lock:
+            if (self.final_farewell_request_id != req_id or
+                self.final_farewell_generation != gen or
+                self.final_farewell_attempt != attempt):
+                logger.info("Stale final farewell event ignored. expected=%s received=%s", self.final_farewell_request_id, req_id)
+                return
+
+            if not self.final_farewell_audio_started or self.final_farewell_audio_chunks <= 0 or not self.final_farewell_turn_complete_received:
+                logger.warning("Final farewell validation check failed: missing audio or turn_complete.")
+                valid = False
+            else:
+                norm_buf = self._normalize_text(self.final_farewell_transcript_buffer)
+                norm_phrase = self._normalize_text(FINAL_FAREWELL_TEXT)
+                valid = norm_phrase in norm_buf
+
+            if valid:
+                mark_name = f"final_farewell_end:{req_id}"
+                self.pending_marks[mark_name] = {
+                    "type": "final_farewell",
+                    "request_id": req_id,
+                    "created_at": time.time()
+                }
+                logger.info("Final farewell transcript complete. chars=%d", len(self.final_farewell_transcript_buffer.strip()))
+                logger.info("Final farewell turn_complete accepted. mark=%s", mark_name)
+                send_payload = {
+                    "event": "mark",
+                    "streamSid": self.stream_sid,
+                    "mark": {"name": mark_name}
+                }
+            else:
+                logger.warning("Final farewell transcript incomplete: '%s'. Marking attempt %d as failed.", self.final_farewell_transcript_buffer.strip(), attempt)
+                if self.final_farewell_attempt < 1:
+                    self.final_farewell_attempt += 1
+                    self.final_farewell_active = False
+                    should_retry = True
+                    if self.stream_sid:
+                        clear_payload = {
+                            "event": "clear",
+                            "streamSid": self.stream_sid
+                        }
+                else:
+                    logger.error("Final farewell retries exhausted without complete transcript.")
+
+        if send_payload and send_to_twilio_cb:
+            await send_to_twilio_cb(send_payload)
+        elif should_retry:
+            if clear_payload and send_to_twilio_cb:
+                await send_to_twilio_cb(clear_payload)
+            await self.trigger_final_farewell()
+
     async def request_finalization(self) -> None:
-        """Transitions the phase to FINALIZING and schedules the mandatory final farewell."""
+        """Transitions the phase to FINALIZING_DRAINING or FINAL_FAREWELL_ACTIVE directly."""
+        should_trigger = False
         async with self.silence_state_lock:
             if self.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED:
                 return
-            if self.onboarding_phase == OnboardingPhase.FINALIZING:
+            if self.onboarding_phase in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE]:
                 return
 
-            logger.info("Roleplay finalization requested. Switching phase to FINALIZING.")
-            self.onboarding_phase = OnboardingPhase.FINALIZING
             self.finalization_requested = True
 
             # Cancel silence watch timer
@@ -1299,23 +1415,35 @@ class GeminiVoiceSession:
                 self.silence_watch_task.cancel()
             self.silence_watch_task = None
 
-            # If user is not currently speaking, trigger farewell immediately
-            if not self.user_speaking:
-                import asyncio
-                asyncio.create_task(self.trigger_final_farewell())
+            has_active_turn = (
+                self.current_model_turn_kind == "normal_turn" or
+                self.model_speaking is True
+            )
+
+            if has_active_turn:
+                logger.info("Roleplay finalization pending current model turn drain.")
+                self.onboarding_phase = OnboardingPhase.FINALIZING_DRAINING
+            else:
+                logger.info("No active model turn to drain. Starting final farewell directly.")
+                self.onboarding_phase = OnboardingPhase.FINAL_FAREWELL_ACTIVE
+                self.final_farewell_generation += 1
+                self.final_farewell_attempt = 0
+                should_trigger = True
+
+        if should_trigger:
+            await self.trigger_final_farewell()
 
     async def trigger_final_farewell(self) -> None:
         """Triggers the mandatory final farewell instruction to Gemini Live."""
         req_id = None
         async with self.silence_state_lock:
-            if (self.onboarding_phase != OnboardingPhase.FINALIZING or
+            if (self.onboarding_phase != OnboardingPhase.FINAL_FAREWELL_ACTIVE or
                 self.final_farewell_completed or
-                self.user_speaking or
                 not self.stream_sid or
                 not self._ready):
                 return
 
-            req_id = f"farewell:{self.wait_cycle_id}:{self.final_farewell_retry_count}"
+            req_id = f"farewell:{self.wait_cycle_id}:{self.final_farewell_generation}:{self.final_farewell_attempt}"
 
             if self.final_farewell_request_id == req_id and self.final_farewell_active:
                 logger.warning("Duplicate final farewell suppressed. req_id=%s", req_id)
@@ -1325,13 +1453,18 @@ class GeminiVoiceSession:
             self.final_farewell_active = True
             self.model_speaking = True
             self.awaiting_user_response = False
+            self.final_farewell_audio_started = False
+            self.final_farewell_audio_chunks = 0
+            self.final_farewell_transcript_buffer = ""
+            self.final_farewell_turn_complete_received = False
+            self.final_farewell_transcript_event.clear()
 
             # Explicit model turn context configuration
             self.current_model_turn_kind = "final_farewell"
             self.current_model_turn_request_id = req_id
             self.current_model_turn_interrupted = False
 
-            logger.info("Mandatory final farewell requested. request_id=%s", req_id)
+            logger.info("Mandatory final farewell generation started. request_id=%s", req_id)
 
         phrase = FINAL_FAREWELL_TEXT
         instruction = (
@@ -1345,11 +1478,8 @@ class GeminiVoiceSession:
             "Después guarda silencio."
         )
 
-        async def _dispatch():
-            try:
-                logger.info("Sending final farewell instruction: '%s'", phrase)
-                await self.send_text_turn(instruction)
-            except Exception as e:
-                logger.error("Error sending final farewell: %s", e)
-
-        asyncio.create_task(_dispatch())
+        try:
+            logger.info("Sending final farewell instruction: '%s'", phrase)
+            await self.send_text_turn(instruction)
+        except Exception as e:
+            logger.error("Error sending final farewell: %s", e)

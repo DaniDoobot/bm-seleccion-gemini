@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     gemini_vad_silence_duration_ms: int = 700
 
     final_farewell_timeout_seconds: float = 10.0
+    final_farewell_transcript_grace_ms: int = 750
 
     # ── Server ────────────────────────────────────────────────────────────────
     port: int = 8000

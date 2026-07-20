@@ -140,6 +140,7 @@ Variables configurables (con valores por defecto validados):
 | `GEMINI_VAD_PREFIX_PADDING_MS` | `20` | Relleno VAD configurado en Gemini setup |
 | `GEMINI_VAD_SILENCE_DURATION_MS` | `700` | Silencio VAD en Gemini setup (ms) |
 | `FINAL_FAREWELL_TIMEOUT_SECONDS` | `10.0` | Timeout en segundos para la despedida final obligatoria antes de forzar el cierre |
+| `FINAL_FAREWELL_TRANSCRIPT_GRACE_MS` | `750` | Periodo de gracia (ms) para esperar la transcripción completa de la despedida final |
 | `PORT` | `8000` | Puerto del servidor |
 | `CORS_ORIGINS` | `*` | Orígenes CORS permitidos |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |

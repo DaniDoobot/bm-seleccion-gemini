@@ -276,8 +276,8 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             except Exception as vad_err:
                                 logger.error("VAD processing error: %s", vad_err)
 
-                            # Do not resample or send user audio to Gemini if final farewell is active
-                            if getattr(gemini_session, "final_farewell_active", False):
+                            # Do not resample or send user audio to Gemini if finalization is active
+                            if getattr(gemini_session, "finalization_requested", False) or getattr(gemini_session, "onboarding_phase", None) in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE, OnboardingPhase.FINALIZING]:
                                 continue
 
                             pcm_16k_b64, twilio_rate_state = decode_twilio_to_gemini(
@@ -323,8 +323,12 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             )
 
                     elif event_type == "audio":
-                        # Set normal turn context under lock if not already a silence reminder or final farewell
-                        if not gemini_session.model_speaking:
+                        if gemini_session.current_model_turn_kind == "final_farewell" or gemini_session.onboarding_phase == OnboardingPhase.FINAL_FAREWELL_ACTIVE:
+                            if not gemini_session.final_farewell_audio_started:
+                                gemini_session.final_farewell_audio_started = True
+                                logger.info("First final farewell audio received. request_id=%s", gemini_session.final_farewell_request_id)
+                            gemini_session.final_farewell_audio_chunks += 1
+                        elif not gemini_session.model_speaking:
                             async with gemini_session.silence_state_lock:
                                 if gemini_session.current_model_turn_kind not in ["silence_reminder", "final_farewell"]:
                                     gemini_session.current_model_turn_kind = "normal_turn"
@@ -359,8 +363,8 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             await websocket.send_text(json.dumps(media_msg))
 
                     elif event_type == "interrupted":
-                        if gemini_session.final_farewell_active:
-                            logger.info("Ignored Gemini interruption during mandatory final farewell.")
+                        if gemini_session.finalization_requested or gemini_session.onboarding_phase in [OnboardingPhase.FINALIZING_DRAINING, OnboardingPhase.FINAL_FAREWELL_ACTIVE, OnboardingPhase.FINALIZING]:
+                            logger.info("Ignored Gemini interruption during finalization.")
                             continue
 
                         # Reset model speaking and silence reminder active status
@@ -388,8 +392,14 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             )
                             break
 
+                        async def _send_to_twilio(payload: dict) -> None:
+                            try:
+                                await websocket.send_text(json.dumps(payload))
+                            except Exception as send_err:
+                                logger.error("Error sending payload to Twilio: %s", send_err)
+
                         # Consume turn complete and get mark payload
-                        mark_payload = await gemini_session.consume_turn_complete()
+                        mark_payload = await gemini_session.consume_turn_complete(send_to_twilio_cb=_send_to_twilio)
                         if mark_payload:
                             await websocket.send_text(json.dumps(mark_payload))
 
@@ -504,10 +514,13 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
             logger.error("Failed to send session completed event: %s", exc)
 
         await gemini_session.close()
-        try:
-            await websocket.close()
-        except Exception:
-            pass
+        if not getattr(gemini_session, "twilio_close_sent", False):
+            gemini_session.twilio_close_sent = True
+            try:
+                await websocket.close(code=1000)
+                logger.info("Twilio media stream close frame sent after final farewell.")
+            except Exception:
+                pass
         logger.info(
             "Voice stream closed. scenario=%s stream_sid=%s",
             scenario_config.scenario_id,
