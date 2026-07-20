@@ -1510,3 +1510,194 @@ def test_scenario_system_prompts_rgpd_mention_intact():
     assert "consentimiento" in sc_1.system_instruction
     assert "RGPD" in sc_2.system_instruction
     assert "consentimiento" in sc_2.system_instruction
+
+
+@pytest.mark.asyncio
+async def test_roleplay_finalization_flow():
+    """Verify finalization transitions, phases, exact phrases, and mark generation."""
+    settings = Settings(env_file=None)
+    session = GeminiVoiceSession(settings=settings, system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    
+    # 1. Detectar el final del roleplay no cambia directamente a ROLEPLAY_FINISHED
+    # 2. Se entra primero en FINALIZING
+    session.onboarding_phase = OnboardingPhase.ROLEPLAY_ACTIVE
+    
+    # We simulate output transcription containing termination phrase
+    # It should transition to FINALIZING
+    session.process_model_transcript("La prueba ha terminado. Gracias por participar.")
+    await asyncio.sleep(0.05)
+    
+    assert session.onboarding_phase == OnboardingPhase.FINALIZING
+    assert session.finalization_requested is True
+    assert session.final_farewell_completed is False
+    
+    # 3. La frase final es exactamente "La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical."
+    from app.core.gemini_session import FINAL_FAREWELL_TEXT
+    assert FINAL_FAREWELL_TEXT == "La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical."
+    
+    # 4. La frase se aplica a seleccion_1
+    from app.scenarios.registry import get_scenario
+    sc_1 = get_scenario("seleccion_1")
+    assert sc_1.completion_phrase == FINAL_FAREWELL_TEXT
+    
+    # 5. La frase se aplica a seleccion_2
+    sc_2 = get_scenario("seleccion_2")
+    assert sc_2.completion_phrase == FINAL_FAREWELL_TEXT
+    
+    # 6. No se cambia a ROLEPLAY_FINISHED al recibir turn_complete
+    # 7. turn_complete genera un mark final_farewell_end
+    # First, let's trigger final farewell:
+    await session.trigger_final_farewell()
+    assert session.final_farewell_active is True
+    assert session.current_model_turn_kind == "final_farewell"
+    
+    payload = await session.consume_turn_complete()
+    assert payload is not None
+    assert payload["mark"]["name"].startswith("final_farewell_end:farewell:")
+    assert session.onboarding_phase == OnboardingPhase.FINALIZING  # Not finished yet!
+    
+    # 8. Solo el mark devuelto por Twilio permite pasar a ROLEPLAY_FINISHED
+    mark_name = payload["mark"]["name"]
+    await session.handle_twilio_mark(mark_name)
+    
+    assert session.final_farewell_active is False
+    assert session.final_farewell_completed is True
+    assert session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED
+    assert session.completion_reason == "roleplay_finished"
+
+
+@pytest.mark.asyncio
+async def test_user_speech_during_farewell_ignored():
+    """Verify that user speech during farewell does not send clear or cancel farewell, and audio is blocked."""
+    session = GeminiVoiceSession(settings=Settings(env_file=None), system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.onboarding_phase = OnboardingPhase.FINALIZING
+    
+    mock_clear = AsyncMock()
+    session.on_twilio_clear = mock_clear
+    
+    # Trigger final farewell
+    await session.trigger_final_farewell()
+    assert session.final_farewell_active is True
+    
+    # 9. El usuario hablando durante la despedida no envía clear
+    session.on_user_speech_start()
+    mock_clear.assert_not_called()
+    assert session.final_farewell_active is True
+    assert session.current_model_turn_interrupted is False
+
+
+@pytest.mark.asyncio
+async def test_barge_in_previo_provoca_despedida_controlada():
+    """Verify that a barge-in during the initial termination attempt provokes a clean farewell afterward."""
+    session = GeminiVoiceSession(settings=Settings(env_file=None), system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.onboarding_phase = OnboardingPhase.ROLEPLAY_ACTIVE
+    
+    # 11. Un barge-in previo que eliminó el primer cierre provoca una nueva despedida controlada.
+    # Barge-in starts while Gemini is speaking
+    session.on_user_speech_start()
+    session.process_model_transcript("La prueba ha terminado, gracias por participar en el proceso.")
+    await asyncio.sleep(0.02)
+    assert session.onboarding_phase == OnboardingPhase.FINALIZING
+    assert session.final_farewell_active is False # user is speaking, farewell not active yet
+    
+    # User finishes speaking
+    session.on_user_speech_end()
+    await asyncio.sleep(0.02)
+    
+    # Farewell is automatically triggered once user finishes speaking!
+    assert session.final_farewell_active is True
+    assert session.current_model_turn_kind == "final_farewell"
+
+
+@pytest.mark.asyncio
+async def test_stale_or_duplicate_farewell_mark_ignored():
+    """Verify that stale or duplicate farewell marks do not finalize the session."""
+    session = GeminiVoiceSession(settings=Settings(env_file=None), system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    session.onboarding_phase = OnboardingPhase.FINALIZING
+    
+    # Trigger final farewell
+    await session.trigger_final_farewell()
+    
+    # 12. Un mark antiguo o duplicado no finaliza la sesión
+    session.pending_marks["final_farewell_end:farewell:0:0"] = {
+        "type": "final_farewell",
+        "request_id": "farewell:0:0"
+    }
+    # This mark has wrong request ID (which is farewell:0:0 but current is farewell:0:0-like retry count)
+    await session.handle_twilio_mark("final_farewell_end:farewell:9:9") # non-existent mark
+    assert session.onboarding_phase == OnboardingPhase.FINALIZING
+    assert session.final_farewell_completed is False
+
+
+@pytest.mark.asyncio
+async def test_rgpd_rejection_farewell_preserved():
+    """Verify that RGPD rejection preserves its specific farewell and does not use final farewell."""
+    session = GeminiVoiceSession(settings=Settings(env_file=None), system_instruction="system")
+    session.onboarding_phase = OnboardingPhase.WAITING_RGPD_ACCEPTANCE
+    
+    # 16. El RGPD rechazado conserva su despedida específica
+    session._update_onboarding_state("no acepto", is_user=True)
+    assert session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED
+    assert session.completion_reason == "rgpd_rejected"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_farewell_completion_timeout_and_retry():
+    """Verify that wait_for_farewell_completion retries once on timeout, then completes with final_farewell_timeout."""
+    session = GeminiVoiceSession(settings=Settings(env_file=None), system_instruction="system")
+    session.stream_sid = "MZ123"
+    session._ready = True
+    
+    # Enable finalization request
+    session.onboarding_phase = OnboardingPhase.FINALIZING
+    session.finalization_requested = True
+    
+    # We will run a mock or inline execution of wait_for_farewell_completion
+    # to verify the state transitions on timeout.
+    # To do this, we can define the logic exactly as it is in the router:
+    async def wait_for_farewell_completion_mock():
+        max_retries = 1
+        timeout = 0.05  # short timeout for test
+
+        while not session.final_farewell_completed:
+            try:
+                await asyncio.wait_for(session.final_farewell_playback_event.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                if session.final_farewell_retry_count < max_retries:
+                    async with session.silence_state_lock:
+                        session.final_farewell_retry_count += 1
+                        for key in list(session.pending_marks.keys()):
+                            if session.pending_marks[key].get("type") == "final_farewell":
+                                session.pending_marks.pop(key, None)
+                        session.final_farewell_active = False
+                        session.final_farewell_playback_event.clear()
+                    await session.trigger_final_farewell()
+                else:
+                    async with session.silence_state_lock:
+                        session.final_farewell_active = False
+                        session.final_farewell_completed = True
+                        session.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+                        session.completion_reason = "final_farewell_timeout"
+                    break
+
+    # Trigger first farewell attempt
+    await session.trigger_final_farewell()
+    assert session.final_farewell_retry_count == 0
+    assert session.final_farewell_active is True
+    
+    # Run the mock completion waiter
+    await wait_for_farewell_completion_mock()
+    
+    # It should have retried once, then timed out and ended the call cleanly
+    assert session.final_farewell_retry_count == 1
+    assert session.final_farewell_completed is True
+    assert session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED
+    assert session.completion_reason == "final_farewell_timeout"

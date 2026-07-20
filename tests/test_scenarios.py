@@ -130,7 +130,7 @@ class TestScenarioConfigs:
         assert "MIGUEL PÉREZ GÓMEZ" in instr
         assert "save_candidate_context" in instr
         assert "bm_atp_muro_doctor" in instr
-        assert "La prueba ha terminado. Gracias por participar." in instr
+        assert "La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical." in instr
 
     def test_seleccion_1_initial_message(self):
         expected = (
@@ -230,7 +230,7 @@ class TestSeleccion2Config:
         )
 
         session.onboarding_phase = OnboardingPhase.ROLEPLAY_ACTIVE
-        session._model_transcript_accumulator = "La prueba ha terminado. Gracias por participar."
+        session._model_transcript_accumulator = SELECCION_2_CONFIG.completion_phrase
 
         norm_accumulated = session._normalize_text(session._model_transcript_accumulator)
         norm_closure = session._normalize_text(session._completion_phrase)

@@ -60,6 +60,7 @@ def check_closure(text: str) -> bool:
     
     closure_phrases = [
         "la prueba ha terminado",
+        "la simulacion ha terminado",
         "gracias por participar",
         "no puedo proporcionar feedback",
         "no puedo dar feedback",

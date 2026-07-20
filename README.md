@@ -139,6 +139,7 @@ Variables configurables (con valores por defecto validados):
 | `USER_SPEECH_HANGOVER_MS` | `250` | Periodo de mantenimiento (ms) tras silencio para confirmar fin de voz |
 | `GEMINI_VAD_PREFIX_PADDING_MS` | `20` | Relleno VAD configurado en Gemini setup |
 | `GEMINI_VAD_SILENCE_DURATION_MS` | `700` | Silencio VAD en Gemini setup (ms) |
+| `FINAL_FAREWELL_TIMEOUT_SECONDS` | `10.0` | Timeout en segundos para la despedida final obligatoria antes de forzar el cierre |
 | `PORT` | `8000` | Puerto del servidor |
 | `CORS_ORIGINS` | `*` | Orígenes CORS permitidos |
 | `LOG_LEVEL` | `INFO` | Nivel de logging |

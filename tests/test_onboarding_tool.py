@@ -900,7 +900,7 @@ def test_end_to_end_roleplay_finished_logic():
     scenario = get_scenario("seleccion_1")
     assert scenario is not None
     prompt_content = scenario.system_instruction
-    assert "La prueba ha terminado. Gracias por participar." in prompt_content
+    assert "La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical." in prompt_content
     
     # Setup a dummy session
     session = GeminiVoiceSession(
@@ -910,13 +910,13 @@ def test_end_to_end_roleplay_finished_logic():
     
     # 2. Receiving exact termination phrase transitions to ROLEPLAY_FINISHED
     session.onboarding_phase = OnboardingPhase.ROLEPLAY_ACTIVE
-    session._model_transcript_accumulator = "La prueba ha terminado. Gracias por participar."
+    session._model_transcript_accumulator = "La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical."
     
     # Simulate a turnComplete event processing in the receive loop
     # We will trigger the transition logic directly to test it
     if session.onboarding_phase == OnboardingPhase.ROLEPLAY_ACTIVE:
         norm_accumulated = session._normalize_text(session._model_transcript_accumulator)
-        norm_closure = session._normalize_text("La prueba ha terminado. Gracias por participar.")
+        norm_closure = session._normalize_text("La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical.")
         if norm_closure in norm_accumulated:
             session.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
             
@@ -924,11 +924,11 @@ def test_end_to_end_roleplay_finished_logic():
     
     # 3. Partial phrase does NOT transition
     session.onboarding_phase = OnboardingPhase.ROLEPLAY_ACTIVE
-    session._model_transcript_accumulator = "La prueba ha terminado."
+    session._model_transcript_accumulator = "La simulación ha terminado."
     
     if session.onboarding_phase == OnboardingPhase.ROLEPLAY_ACTIVE:
         norm_accumulated = session._normalize_text(session._model_transcript_accumulator)
-        norm_closure = session._normalize_text("La prueba ha terminado. Gracias por participar.")
+        norm_closure = session._normalize_text("La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical.")
         if norm_closure in norm_accumulated:
             session.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
             

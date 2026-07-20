@@ -276,6 +276,10 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             except Exception as vad_err:
                                 logger.error("VAD processing error: %s", vad_err)
 
+                            # Do not resample or send user audio to Gemini if final farewell is active
+                            if getattr(gemini_session, "final_farewell_active", False):
+                                continue
+
                             pcm_16k_b64, twilio_rate_state = decode_twilio_to_gemini(
                                 payload, twilio_rate_state
                             )
@@ -319,10 +323,10 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             )
 
                     elif event_type == "audio":
-                        # Set normal turn context under lock if not already a silence reminder
+                        # Set normal turn context under lock if not already a silence reminder or final farewell
                         if not gemini_session.model_speaking:
                             async with gemini_session.silence_state_lock:
-                                if gemini_session.current_model_turn_kind != "silence_reminder":
+                                if gemini_session.current_model_turn_kind not in ["silence_reminder", "final_farewell"]:
                                     gemini_session.current_model_turn_kind = "normal_turn"
                                     gemini_session.current_model_turn_request_id = None
                                     gemini_session.current_model_turn_interrupted = False
@@ -355,6 +359,10 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             await websocket.send_text(json.dumps(media_msg))
 
                     elif event_type == "interrupted":
+                        if gemini_session.final_farewell_active:
+                            logger.info("Ignored Gemini interruption during mandatory final farewell.")
+                            continue
+
                         # Reset model speaking and silence reminder active status
                         gemini_session.model_speaking = False
                         gemini_session.silence_reminder_active = False
@@ -372,13 +380,12 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
                             await websocket.send_text(json.dumps(clear_msg))
 
                     elif event_type == "turn_complete":
-                        # Check if roleplay is finished. If so, wait 1.5s for audio buffer to clear, then exit.
+                        # Check if roleplay is finished. If so, break immediately.
                         if gemini_session.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED:
                             logger.info(
-                                "Roleplay reached finished phase. Waiting 1.5s for audio buffer to clear, then closing stream. scenario=%s",
+                                "Roleplay reached finished phase. Closing stream. scenario=%s",
                                 scenario_config.scenario_id,
                             )
-                            await asyncio.sleep(1.5)
                             break
 
                         # Consume turn complete and get mark payload
@@ -407,11 +414,50 @@ async def handle_voice_stream(websocket: WebSocket, scenario_id: str) -> None:
         while True:
             gemini_session.last_close_code = None
 
+            async def wait_for_farewell_completion():
+                while True:
+                    if gemini_session.finalization_requested:
+                        break
+                    await asyncio.sleep(0.1)
+
+                max_retries = 1
+                timeout = settings.final_farewell_timeout_seconds
+
+                while not gemini_session.final_farewell_completed:
+                    try:
+                        logger.info("Waiting for final farewell playback confirmation mark...")
+                        await asyncio.wait_for(gemini_session.final_farewell_playback_event.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "Final farewell playback timeout. retry=%d/%d",
+                            gemini_session.final_farewell_retry_count + 1,
+                            max_retries
+                        )
+                        if gemini_session.final_farewell_retry_count < max_retries:
+                            async with gemini_session.silence_state_lock:
+                                gemini_session.final_farewell_retry_count += 1
+                                for key in list(gemini_session.pending_marks.keys()):
+                                    if gemini_session.pending_marks[key].get("type") == "final_farewell":
+                                        gemini_session.pending_marks.pop(key, None)
+                                gemini_session.final_farewell_active = False
+                                gemini_session.final_farewell_playback_event.clear()
+                            await gemini_session.trigger_final_farewell()
+                        else:
+                            logger.error("Final farewell playback timeout limit reached. Ending call with final_farewell_timeout.")
+                            async with gemini_session.silence_state_lock:
+                                gemini_session.final_farewell_active = False
+                                gemini_session.final_farewell_completed = True
+                                gemini_session.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+                                gemini_session.completion_reason = "final_farewell_timeout"
+                            break
+                logger.info("Final farewell playback wait completed.")
+
             tw_task = asyncio.create_task(twilio_to_gemini_loop())
             gem_task = asyncio.create_task(gemini_to_twilio_loop())
+            farewell_task = asyncio.create_task(wait_for_farewell_completion())
 
             done, pending = await asyncio.wait(
-                [tw_task, gem_task],
+                [tw_task, gem_task, farewell_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 

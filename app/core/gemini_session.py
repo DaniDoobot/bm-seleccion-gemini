@@ -32,6 +32,12 @@ GEMINI_SERVER_CONTENT = "serverContent"
 GEMINI_TOOL_CALL = "toolCall"
 
 
+FINAL_FAREWELL_TEXT = (
+    "La simulación ha terminado, gracias por participar "
+    "en el proceso de selección de Boston Medical."
+)
+
+
 class OnboardingPhase(str, Enum):
     WAITING_READY = "waiting_ready"
     WAITING_CANDIDATE_DATA = "waiting_candidate_data"
@@ -43,6 +49,7 @@ class OnboardingPhase(str, Enum):
     EXPLANATION = "explanation"
     READY_TO_START_ROLEPLAY = "ready_to_start_roleplay"
     ROLEPLAY_ACTIVE = "roleplay_active"
+    FINALIZING = "finalizing"
     ROLEPLAY_FINISHED = "roleplay_finished"
 
 
@@ -57,7 +64,7 @@ class GeminiVoiceSession:
         enable_transcription: bool = False,
         roleplay_transition_phrase: str = "Perfecto, comenzamos la simulación. A partir de ahora soy el paciente.",
         roleplay_initial_phrase: str = "Mira, quiero hablar con el doctor ahora mismo.",
-        completion_phrase: str = "La prueba ha terminado. Gracias por participar.",
+        completion_phrase: str = FINAL_FAREWELL_TEXT,
     ) -> None:
         """Initialize the Gemini Live session wrapper."""
         self._settings = settings
@@ -141,6 +148,16 @@ class GeminiVoiceSession:
         self.user_speech_ended_at = None
         self.first_model_audio_at = None
         self.response_latency_ms = None
+
+        # Finalization & Mandatory Farewell tracking variables
+        self.finalization_requested: bool = False
+        self.final_farewell_active: bool = False
+        self.final_farewell_completed: bool = False
+        self.final_farewell_request_id: Optional[str] = None
+        self.final_farewell_mark: Optional[str] = None
+        self.final_farewell_retry_count: int = 0
+        self._logged_farewell_ignore: bool = False
+        self.final_farewell_playback_event = asyncio.Event()
 
 
     # ── Onboarding State Machine Transitions ──────────────────────────────────
@@ -345,6 +362,23 @@ class GeminiVoiceSession:
                 if any(e in text_lower for e in elements):
                     self.onboarding_phase = OnboardingPhase.READY_TO_START_ROLEPLAY
 
+            elif self.onboarding_phase == OnboardingPhase.ROLEPLAY_ACTIVE:
+                norm_accumulated = self._normalize_text(text)
+                has_terminado = (
+                    "la prueba ha terminado" in norm_accumulated or 
+                    "la prueba ha finalizado" in norm_accumulated or
+                    "la simulacion ha terminado" in norm_accumulated or
+                    "la simulacion ha finalizado" in norm_accumulated
+                )
+                has_gracias = (
+                    "gracias por participar" in norm_accumulated or 
+                    "gracias por su participacion" in norm_accumulated or
+                    "gracias por participar en el proceso" in norm_accumulated
+                )
+                if (has_terminado and has_gracias) or ("la prueba ha terminado gracias por participar" in norm_accumulated) or ("la simulacion ha terminado gracias por participar" in norm_accumulated) or ("gracias por participar" in norm_accumulated and "terminado" in norm_accumulated):
+                    import asyncio
+                    asyncio.create_task(self.request_finalization())
+
     def _normalize_text(self, text: str) -> str:
         """Helper to normalize text for string matching, stripping punctuation and accents."""
         import re
@@ -454,9 +488,9 @@ class GeminiVoiceSession:
         self._user_transcript_accumulator = ""
         self._model_transcript_accumulator = ""
         
-        # Skip processing if it's the greeting trigger prompt
+        # Skip processing if it's the greeting trigger prompt or an internal control instruction
         text_lower = text.lower()
-        if "di unicamente" not in text_lower and "sin preambulos" not in text_lower and "di únicamente" not in text_lower and "sin preámbulos" not in text_lower:
+        if "control interno" not in text_lower and "di unicamente" not in text_lower and "sin preambulos" not in text_lower and "di únicamente" not in text_lower and "sin preámbulos" not in text_lower:
             self.process_user_transcript(text)
 
         msg = {
@@ -755,11 +789,20 @@ class GeminiVoiceSession:
                             logger.info("[Onboarding] Roleplay started successfully. Phase: ROLEPLAY_ACTIVE")
                     elif self.onboarding_phase == OnboardingPhase.ROLEPLAY_ACTIVE:
                         norm_accumulated = self._normalize_text(self._model_transcript_accumulator)
-                        has_terminado = "la prueba ha terminado" in norm_accumulated or "la prueba ha finalizado" in norm_accumulated
-                        has_gracias = "gracias por participar" in norm_accumulated or "gracias por su participacion" in norm_accumulated
-                        if (has_terminado and has_gracias) or ("la prueba ha terminado gracias por participar" in norm_accumulated):
-                            self.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
-                            logger.info("[Onboarding] Roleplay finished successfully. Phase: ROLEPLAY_FINISHED")
+                        has_terminado = (
+                            "la prueba ha terminado" in norm_accumulated or 
+                            "la prueba ha finalizado" in norm_accumulated or
+                            "la simulacion ha terminado" in norm_accumulated or
+                            "la simulacion ha finalizado" in norm_accumulated
+                        )
+                        has_gracias = (
+                            "gracias por participar" in norm_accumulated or 
+                            "gracias por su participacion" in norm_accumulated or
+                            "gracias por participar en el proceso" in norm_accumulated
+                        )
+                        if (has_terminado and has_gracias) or ("la prueba ha terminado gracias por participar" in norm_accumulated) or ("la simulacion ha terminado gracias por participar" in norm_accumulated) or ("gracias por participar" in norm_accumulated and "terminado" in norm_accumulated):
+                            import asyncio
+                            asyncio.create_task(self.request_finalization())
                     
                     self._model_transcript_accumulator = ""
                     self._user_transcript_accumulator = ""
@@ -881,6 +924,21 @@ class GeminiVoiceSession:
         if getattr(self, "_reconnecting", False):
             return
 
+        if getattr(self, "final_farewell_active", False):
+            import audioop
+            try:
+                rms = audioop.rms(pcm_8k, 2)
+                threshold = self._settings.user_speech_rms_threshold
+                if rms > threshold:
+                    if not getattr(self, "_logged_farewell_ignore", False):
+                        logger.info("User speech ignored during mandatory farewell. call_sid=%s", self._mask_sid(self.call_sid))
+                        self._logged_farewell_ignore = True
+                else:
+                    self._logged_farewell_ignore = False
+            except Exception:
+                pass
+            return
+
         import audioop
         import time
 
@@ -971,6 +1029,13 @@ class GeminiVoiceSession:
         self.first_model_audio_at = None
         self.response_latency_ms = None
 
+        if (self.onboarding_phase == OnboardingPhase.FINALIZING and
+            not self.final_farewell_active and
+            not self.final_farewell_completed):
+            logger.info("Waiting for user speech to end before final farewell. User speech ended. Triggering final farewell.")
+            import asyncio
+            asyncio.create_task(self.trigger_final_farewell())
+
     async def handle_twilio_mark(self, mark_name: str) -> None:
         """Handle Twilio mark event indicating bot playback completed."""
         import time
@@ -1029,6 +1094,24 @@ class GeminiVoiceSession:
                 self.awaiting_user_response = True
                 # Do NOT reset silence_reminder_sent to False
                 # Do NOT start a new temporizador/silence watch
+
+            elif mark_type == "final_farewell":
+                req_id = mark_info.get("request_id")
+                if req_id != self.final_farewell_request_id:
+                    logger.info(
+                        "Stale playback mark ignored (wrong request id). mark=%s req_id=%s current=%s",
+                        mark_name,
+                        req_id,
+                        self.final_farewell_request_id
+                    )
+                    return
+
+                logger.info("Final farewell playback completed. request_id=%s", req_id)
+                self.final_farewell_active = False
+                self.final_farewell_completed = True
+                self.onboarding_phase = OnboardingPhase.ROLEPLAY_FINISHED
+                self.completion_reason = "roleplay_finished"
+                self.final_farewell_playback_event.set()
 
     async def start_silence_watch(self) -> None:
         """Start the silence watch timer in a background task."""
@@ -1163,6 +1246,14 @@ class GeminiVoiceSession:
                     "reminder_id": self.silence_reminder_count,
                     "created_at": time.time()
                 }
+            elif kind == "final_farewell":
+                mark_name = f"final_farewell_end:{self.final_farewell_request_id}"
+                mark_metadata = {
+                    "type": "final_farewell",
+                    "request_id": self.final_farewell_request_id,
+                    "created_at": time.time()
+                }
+                logger.info("Final farewell Gemini turn completed. mark=%s", mark_name)
             else:
                 self.bot_turn_counter += 1
                 mark_name = f"bot_turn_end:{self.bot_turn_counter}"
@@ -1190,3 +1281,75 @@ class GeminiVoiceSession:
                     }
                 }
             return None
+
+    async def request_finalization(self) -> None:
+        """Transitions the phase to FINALIZING and schedules the mandatory final farewell."""
+        async with self.silence_state_lock:
+            if self.onboarding_phase == OnboardingPhase.ROLEPLAY_FINISHED:
+                return
+            if self.onboarding_phase == OnboardingPhase.FINALIZING:
+                return
+
+            logger.info("Roleplay finalization requested. Switching phase to FINALIZING.")
+            self.onboarding_phase = OnboardingPhase.FINALIZING
+            self.finalization_requested = True
+
+            # Cancel silence watch timer
+            if self.silence_watch_task and not self.silence_watch_task.done():
+                self.silence_watch_task.cancel()
+            self.silence_watch_task = None
+
+            # If user is not currently speaking, trigger farewell immediately
+            if not self.user_speaking:
+                import asyncio
+                asyncio.create_task(self.trigger_final_farewell())
+
+    async def trigger_final_farewell(self) -> None:
+        """Triggers the mandatory final farewell instruction to Gemini Live."""
+        req_id = None
+        async with self.silence_state_lock:
+            if (self.onboarding_phase != OnboardingPhase.FINALIZING or
+                self.final_farewell_completed or
+                self.user_speaking or
+                not self.stream_sid or
+                not self._ready):
+                return
+
+            req_id = f"farewell:{self.wait_cycle_id}:{self.final_farewell_retry_count}"
+
+            if self.final_farewell_request_id == req_id and self.final_farewell_active:
+                logger.warning("Duplicate final farewell suppressed. req_id=%s", req_id)
+                return
+
+            self.final_farewell_request_id = req_id
+            self.final_farewell_active = True
+            self.model_speaking = True
+            self.awaiting_user_response = False
+
+            # Explicit model turn context configuration
+            self.current_model_turn_kind = "final_farewell"
+            self.current_model_turn_request_id = req_id
+            self.current_model_turn_interrupted = False
+
+            logger.info("Mandatory final farewell requested. request_id=%s", req_id)
+
+        phrase = FINAL_FAREWELL_TEXT
+        instruction = (
+            "CONTROL INTERNO DE FINALIZACIÓN:\n"
+            "Pronuncia exactamente una vez la siguiente frase:\n"
+            f"\"{phrase}\"\n"
+            "No la repitas.\n"
+            "No añadas ninguna palabra antes ni después.\n"
+            "No continúes el roleplay.\n"
+            "No respondas a nuevas preguntas.\n"
+            "Después guarda silencio."
+        )
+
+        async def _dispatch():
+            try:
+                logger.info("Sending final farewell instruction: '%s'", phrase)
+                await self.send_text_turn(instruction)
+            except Exception as e:
+                logger.error("Error sending final farewell: %s", e)
+
+        asyncio.create_task(_dispatch())

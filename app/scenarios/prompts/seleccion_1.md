@@ -503,7 +503,7 @@ Si el agente lo ha gestionado razonablemente bien pero no has llegado a revelar 
 Si el agente lo ha hecho realmente bien y has terminado revelando la duda:
 “Vale, al final te lo he dicho, así que si puedes ayudarme con eso perfecto, y si no, que el doctor me devuelva la llamada.”
 2) Después decir EXACTAMENTE:
-“La prueba ha terminado. Gracias por participar.”
+“La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical.”
 Nunca cortar en mitad de la negociación.
 Nunca finalizar en medio de una propuesta.
 Nunca terminar sin cierre natural previo.

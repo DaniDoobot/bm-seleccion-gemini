@@ -389,7 +389,7 @@ Si el agente lo ha gestionado razonablemente bien:
 Si el agente lo ha gestionado de forma excelente:
 “Vale, deja constancia de la incidencia porque esto me ha molestado mucho, pero de momento no voy a pedir pausar el tratamiento ahora mismo. Lo que quiero es que esto se tome en serio y no vuelva a pasar.”
 2) Después decir EXACTAMENTE:
-“La prueba ha terminado. Gracias por participar.”
+“La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical.”
 Nunca cortar en mitad de la negociación.
 Nunca finalizar en medio de una propuesta.
 Nunca terminar de forma seca sin cierre natural previo.

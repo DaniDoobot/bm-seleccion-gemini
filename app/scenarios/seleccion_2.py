@@ -117,6 +117,6 @@ SELECCION_2_CONFIG = ScenarioConfig(
     tools=[SAVE_CANDIDATE_CONTEXT_TOOL],
     roleplay_transition_phrase="Perfecto, comenzamos la simulación. A partir de ahora soy el paciente.",
     roleplay_initial_phrase="Mira, llamo porque esto ya me parece inadmisible. Ya reclamé un problema con el envío y sigo igual. Así no puedo seguir.",
-    completion_phrase="La prueba ha terminado. Gracias por participar.",
+    completion_phrase="La simulación ha terminado, gracias por participar en el proceso de selección de Boston Medical.",
     evaluation_agent_id="agent_1401kjcgdv7reg7t41ak0vbt53e5",
 )

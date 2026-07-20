@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     gemini_vad_prefix_padding_ms: int = 20
     gemini_vad_silence_duration_ms: int = 700
 
+    final_farewell_timeout_seconds: float = 10.0
+
     # ── Server ────────────────────────────────────────────────────────────────
     port: int = 8000
     public_url: str = ""
